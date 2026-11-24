@@ -333,121 +333,247 @@ const NOISE_POI_TYPES = new Set([
   "parking",
 ]);
 
+const FOOD_SYNONYMS: Record<string, string[]> = {
+  pizza: ["pizza", "pizzeria", "italian"],
+  taco: ["taco", "taqueria", "mexican"],
+  tacos: ["taco", "taqueria", "mexican"],
+  coffee: ["coffee", "cafe", "espresso", "roast"],
+  cafe: ["cafe", "coffee", "espresso"],
+  burger: ["burger", "american"],
+  burgers: ["burger", "american"],
+  ramen: ["ramen", "japanese", "noodle"],
+  sushi: ["sushi", "japanese"],
+  bagel: ["bagel", "bakery", "deli"],
+  bagels: ["bagel", "bakery", "deli"],
+  bakery: ["bakery", "pastry", "patisserie", "croissant"],
+  donut: ["donut", "doughnut", "bakery"],
+  donuts: ["donut", "doughnut", "bakery"],
+  "ice cream": ["ice_cream", "ice cream", "gelato"],
+  gelato: ["gelato", "ice_cream", "ice cream"],
+  boba: ["boba", "bubble_tea", "tea"],
+  sandwich: ["sandwich", "deli", "sub"],
+  brunch: ["brunch", "breakfast", "cafe", "diner"],
+  breakfast: ["breakfast", "brunch", "cafe", "bakery", "diner"],
+  brewery: ["brewery", "biergarten", "pub", "bar"],
+};
+
+function expandFoodTerms(query: string): string[] {
+  const clean = query.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  if (!clean) return [];
+  const words = clean.split(/\s+/).filter((w) => w.length >= 2);
+  const terms = new Set<string>(words);
+  if (FOOD_SYNONYMS[clean]) {
+    for (const s of FOOD_SYNONYMS[clean]) terms.add(s);
+  }
+  for (const w of words) {
+    if (FOOD_SYNONYMS[w]) {
+      for (const s of FOOD_SYNONYMS[w]) terms.add(s);
+    }
+    // Simple singularization for plural queries (e.g. "pizzerias" -> "pizzeria")
+    if (w.endsWith("s") && w.length > 3) terms.add(w.slice(0, -1));
+  }
+  return Array.from(terms);
+}
+
+interface CachedGooglePlace {
+  name: string;
+  address: string;
+  lat: number;
+  lon: number;
+  rating?: number;
+  ratingCount?: number;
+}
+
+const GOOGLE_PLACES_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const GOOGLE_PLACES_CACHE_MAX = 500;
+const GOOGLE_PLACES_WINDOW_MS = 60 * 1000; // 1 minute
+const GOOGLE_PLACES_MAX_PER_IP = 3;
+const GOOGLE_PLACES_MAX_GLOBAL = 10;
+
+const googlePlacesCache = new Map<
+  string,
+  { expiresAt: number; places: CachedGooglePlace[] }
+>();
+const googlePlacesIpHits = new Map<string, number[]>();
+let googlePlacesGlobalHits: number[] = [];
+
+function allowGooglePlacesCall(clientIp: string): boolean {
+  const now = Date.now();
+  const cutoff = now - GOOGLE_PLACES_WINDOW_MS;
+
+  googlePlacesGlobalHits = googlePlacesGlobalHits.filter((t) => t > cutoff);
+  if (googlePlacesGlobalHits.length >= GOOGLE_PLACES_MAX_GLOBAL) {
+    return false;
+  }
+
+  const key = clientIp || "unknown";
+  const ipTimes = (googlePlacesIpHits.get(key) || []).filter((t) => t > cutoff);
+  if (ipTimes.length >= GOOGLE_PLACES_MAX_PER_IP) {
+    googlePlacesIpHits.set(key, ipTimes);
+    return false;
+  }
+
+  ipTimes.push(now);
+  googlePlacesIpHits.set(key, ipTimes);
+  googlePlacesGlobalHits.push(now);
+
+  // Prevent unbounded IP map growth
+  if (googlePlacesIpHits.size > 500) {
+    for (const [k, times] of googlePlacesIpHits) {
+      if (times.every((t) => t <= cutoff)) googlePlacesIpHits.delete(k);
+    }
+  }
+  return true;
+}
+
 async function resolveFoodViaGooglePlaces(
   start: LatLng,
   endQuery: string,
   idealMeters: number,
   searchRadius: number,
-  maxResults = 4
+  maxResults = 4,
+  clientIp = "unknown"
 ): Promise<PlaceSuggestion[]> {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return [];
 
-  try {
-    const res = await fetch(
-      "https://places.googleapis.com/v1/places:searchText",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": apiKey,
-          "X-Goog-FieldMask":
-            "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.businessStatus",
-        },
-        body: JSON.stringify({
-          textQuery: endQuery,
-          maxResultCount: 12,
-          locationBias: {
-            circle: {
-              center: { latitude: start.lat, longitude: start.lon },
-              radius: Math.min(searchRadius, 15000),
-            },
+  const maxAllowedDist = Math.max(searchRadius * 2.2, 22000);
+  const clampedRadius = Math.min(searchRadius, 15000);
+  // ~1.1km grid cell + normalized query + 2km radius bucket
+  const cacheKey = `${Math.round(start.lat * 100)},${Math.round(start.lon * 100)}|${endQuery.toLowerCase().trim()}|${Math.round(clampedRadius / 2000)}`;
+
+  let rawPlaces: CachedGooglePlace[] | null = null;
+  const cached = googlePlacesCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    rawPlaces = cached.places;
+  } else {
+    if (cached) googlePlacesCache.delete(cacheKey);
+    if (!allowGooglePlacesCall(clientIp)) {
+      return [];
+    }
+
+    try {
+      const res = await fetch(
+        "https://places.googleapis.com/v1/places:searchText",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": apiKey,
+            "X-Goog-FieldMask":
+              "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.businessStatus",
           },
-        }),
-        signal: AbortSignal.timeout(5500),
-      }
-    );
+          body: JSON.stringify({
+            textQuery: endQuery,
+            maxResultCount: 12,
+            locationBias: {
+              circle: {
+                center: { latitude: start.lat, longitude: start.lon },
+                radius: clampedRadius,
+              },
+            },
+          }),
+          signal: AbortSignal.timeout(5500),
+        }
+      );
 
-    if (!res.ok) return [];
-    const data = (await res.json()) as {
-      places?: {
-        displayName?: { text?: string };
-        formattedAddress?: string;
-        location?: { latitude?: number; longitude?: number };
-        rating?: number;
-        userRatingCount?: number;
-        businessStatus?: string;
-      }[];
-    };
+      if (!res.ok) return [];
+      const data = (await res.json()) as {
+        places?: {
+          displayName?: { text?: string };
+          formattedAddress?: string;
+          location?: { latitude?: number; longitude?: number };
+          rating?: number;
+          userRatingCount?: number;
+          businessStatus?: string;
+        }[];
+      };
 
-    const candidates = (data.places || [])
-      .filter(
-        (p) =>
-          p.displayName?.text &&
-          p.location?.latitude != null &&
-          p.location?.longitude != null &&
-          p.businessStatus !== "CLOSED_PERMANENTLY"
-      )
-      .map((p) => {
-        const lat = p.location!.latitude!;
-        const lon = p.location!.longitude!;
-        const dist = haversineMeters(start, { lat, lon });
-        const rating = p.rating ?? 3.8;
-        const count = p.userRatingCount ?? 10;
-        // Favor highly-rated, well-reviewed spots near idealMeters
-        const qualityScore = rating * Math.log10(count + 10) * 320;
-        const distPenalty = Math.abs(dist - idealMeters);
-        const lowRatingPenalty = rating < 4.0 ? (4.0 - rating) * 1800 : 0;
-        return {
+      rawPlaces = (data.places || [])
+        .filter(
+          (p) =>
+            p.displayName?.text &&
+            p.location?.latitude != null &&
+            p.location?.longitude != null &&
+            p.businessStatus !== "CLOSED_PERMANENTLY"
+        )
+        .map((p) => ({
           name: p.displayName!.text!,
           address: p.formattedAddress || p.displayName!.text!,
-          lat,
-          lon,
+          lat: p.location!.latitude!,
+          lon: p.location!.longitude!,
           rating: p.rating,
           ratingCount: p.userRatingCount,
-          score: qualityScore - distPenalty - lowRatingPenalty,
-        };
-      })
-      .sort((a, b) => b.score - a.score);
+        }));
 
-    const results: PlaceSuggestion[] = [];
-    for (const c of candidates) {
-      const isDup = results.some(
-        (r) =>
-          r.shortName.toLowerCase() === c.name.toLowerCase() ||
-          haversineMeters(r, c) < 80
-      );
-      if (isDup) continue;
-      results.push({
-        label:
-          c.rating != null
-            ? `${c.name} (★ ${c.rating.toFixed(1)}${c.ratingCount ? `, ${c.ratingCount}` : ""})`
-            : `${c.name} (${endQuery})`,
-        shortName: c.name,
-        lat: c.lat,
-        lon: c.lon,
-        type: "food",
-        rating: c.rating,
-        ratingCount: c.ratingCount,
+      if (googlePlacesCache.size >= GOOGLE_PLACES_CACHE_MAX) {
+        const oldestKey = googlePlacesCache.keys().next().value;
+        if (oldestKey) googlePlacesCache.delete(oldestKey);
+      }
+      googlePlacesCache.set(cacheKey, {
+        expiresAt: Date.now() + GOOGLE_PLACES_CACHE_TTL_MS,
+        places: rawPlaces,
       });
-      if (results.length >= maxResults) break;
+    } catch {
+      return [];
     }
-    return results;
-  } catch {
-    return [];
   }
+
+  const candidates = rawPlaces
+    .map((p) => {
+      const dist = haversineMeters(start, { lat: p.lat, lon: p.lon });
+      const rating = p.rating ?? 3.8;
+      const count = p.ratingCount ?? 10;
+      // Favor highly-rated, well-reviewed spots near idealMeters
+      const qualityScore = rating * Math.log10(count + 10) * 320;
+      const distPenalty = Math.abs(dist - idealMeters);
+      const lowRatingPenalty = rating < 4.0 ? (4.0 - rating) * 1800 : 0;
+      return {
+        ...p,
+        dist,
+        score: qualityScore - distPenalty - lowRatingPenalty,
+      };
+    })
+    .filter((c) => c.dist <= maxAllowedDist)
+    .sort((a, b) => b.score - a.score);
+
+  const results: PlaceSuggestion[] = [];
+  for (const c of candidates) {
+    const isDup = results.some(
+      (r) =>
+        r.shortName.toLowerCase() === c.name.toLowerCase() ||
+        haversineMeters(r, c) < 80
+    );
+    if (isDup) continue;
+    results.push({
+      label:
+        c.rating != null
+          ? `${c.name} (★ ${c.rating.toFixed(1)}${c.ratingCount ? `, ${c.ratingCount}` : ""})`
+          : `${c.name} (${endQuery})`,
+      shortName: c.name,
+      lat: c.lat,
+      lon: c.lon,
+      type: "food",
+      rating: c.rating,
+      ratingCount: c.ratingCount,
+    });
+    if (results.length >= maxResults) break;
+  }
+  return results;
 }
 
 async function resolveEndPlaces(
   start: LatLng,
   endQuery: string,
   targetMiles?: number | null,
-  maxFoodResults = 4
+  maxFoodResults = 4,
+  clientIp = "unknown"
 ): Promise<PlaceSuggestion[]> {
   const idealMeters = targetMiles
     ? milesToMeters(targetMiles) * 0.85
     : 3200; // ~2 miles default for food/area runs
   const searchRadius = Math.min(Math.max(Math.round(idealMeters * 1.45), 2500), 14000);
+  const maxAllowedDist = Math.max(searchRadius * 2.5, 25000);
   const foodQuery = isFoodOrVibeQuery(endQuery);
 
   // 1a. If GOOGLE_PLACES_API_KEY is configured and this is a food query, rank top spots by live star ratings + reviews
@@ -457,102 +583,105 @@ async function resolveEndPlaces(
       endQuery,
       idealMeters,
       searchRadius,
-      maxFoodResults
+      maxFoodResults,
+      clientIp
     );
     if (ratedSpots.length > 0) return ratedSpots;
   }
 
-  // 1b. Keyless food/drink search via Overpass (returns top distinct notable OSM spots)
+  // 1b. Keyless fuzzy food/drink search via Overpass (nodes + ways, synonym-expanded)
   if (foodQuery) {
-    const clean = endQuery.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-    const firstWord = clean.split(/\s+/)[0] || clean;
-    const overQuery = `
-      [out:json][timeout:6];
-      (
-        node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["name"~"${firstWord}",i](around:${searchRadius},${start.lat},${start.lon});
-        node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["cuisine"~"${firstWord}",i](around:${searchRadius},${start.lat},${start.lon});
-        node["shop"~"bakery|coffee|pastry"]["name"~"${firstWord}",i](around:${searchRadius},${start.lat},${start.lon});
-        node["amenity"="cafe"](around:${searchRadius},${start.lat},${start.lon});
-      );
-      out body 35;
-    `;
-    try {
-      const res = await fetch(OVERPASS_BASE, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": USER_AGENT,
-        },
-        body: `data=${encodeURIComponent(overQuery)}`,
-        signal: AbortSignal.timeout(6000),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { elements?: OverpassElement[] };
-        const candidates = (data.elements || [])
-          .filter((el) => el.lat && el.lon && el.tags?.name)
-          .map((el) => {
-            const tags = el.tags!;
-            const name = tags.name!;
-            const matchesKeyword =
-              name.toLowerCase().includes(firstWord) ||
-              (tags.cuisine || "").toLowerCase().includes(firstWord) ||
-              (tags.amenity || "").toLowerCase().includes(firstWord) ||
-              (tags.shop || "").toLowerCase().includes(firstWord);
-            const dist = haversineMeters(start, { lat: el.lat!, lon: el.lon! });
-            const distPenalty = Math.abs(dist - idealMeters);
-            // Proxy notability bonus when no ratings API key is configured
-            let notabilityBonus = 0;
-            if (tags.website || tags["contact:website"]) notabilityBonus += 350;
-            if (tags.opening_hours) notabilityBonus += 250;
-            if (tags.wikidata || tags.wikipedia) notabilityBonus += 500;
-            if (tags.stars || tags.award) notabilityBonus += 450;
-            return {
-              name,
-              lat: el.lat!,
-              lon: el.lon!,
-              type: tags.cuisine || tags.amenity || tags.shop || "food",
-              score: (matchesKeyword ? 0 : 10000) + distPenalty - notabilityBonus,
-            };
-          })
-          .filter((c) => c.score < 10000)
-          .sort((a, b) => a.score - b.score);
+    const terms = expandFoodTerms(endQuery);
+    const regexPattern = terms.join("|");
+    if (regexPattern) {
+      const overQuery = `
+        [out:json][timeout:7];
+        (
+          nwr["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["name"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
+          nwr["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["cuisine"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
+          nwr["shop"~"bakery|coffee|pastry|deli|ice_cream"]["name"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
+        );
+        out center 40;
+      `;
+      try {
+        const res = await fetch(OVERPASS_BASE, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+          },
+          body: `data=${encodeURIComponent(overQuery)}`,
+          signal: AbortSignal.timeout(7000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { elements?: OverpassElement[] };
+          const candidates = (data.elements || [])
+            .map((el) => {
+              const lat = el.lat ?? el.center?.lat;
+              const lon = el.lon ?? el.center?.lon;
+              const tags = el.tags || {};
+              const name = tags.name;
+              if (!lat || !lon || !name) return null;
+              const hay = `${name} ${tags.cuisine || ""} ${tags.amenity || ""} ${tags.shop || ""}`.toLowerCase();
+              const matchesKeyword = terms.some((t) => hay.includes(t));
+              if (!matchesKeyword) return null;
+              const dist = haversineMeters(start, { lat, lon });
+              const distPenalty = Math.abs(dist - idealMeters);
+              // Proxy notability bonus when no ratings API key is configured
+              let notabilityBonus = 0;
+              if (tags.website || tags["contact:website"]) notabilityBonus += 350;
+              if (tags.opening_hours) notabilityBonus += 250;
+              if (tags.wikidata || tags.wikipedia) notabilityBonus += 500;
+              if (tags.stars || tags.award) notabilityBonus += 450;
+              return {
+                name,
+                lat,
+                lon,
+                type: tags.cuisine || tags.amenity || tags.shop || "food",
+                score: distPenalty - notabilityBonus,
+              };
+            })
+            .filter((c): c is NonNullable<typeof c> => c !== null)
+            .sort((a, b) => a.score - b.score);
 
-        const picked: PlaceSuggestion[] = [];
-        for (const c of candidates) {
-          const isDup = picked.some(
-            (p) =>
-              p.shortName.toLowerCase() === c.name.toLowerCase() ||
-              haversineMeters(p, c) < 100
-          );
-          if (isDup) continue;
-          picked.push({
-            label: `${c.name} (${endQuery})`,
-            shortName: c.name,
-            lat: c.lat,
-            lon: c.lon,
-            type: "food",
-          });
-          if (picked.length >= maxFoodResults) break;
+          const picked: PlaceSuggestion[] = [];
+          for (const c of candidates) {
+            const isDup = picked.some(
+              (p) =>
+                p.shortName.toLowerCase() === c.name.toLowerCase() ||
+                haversineMeters(p, c) < 100
+            );
+            if (isDup) continue;
+            picked.push({
+              label: `${c.name} (${endQuery})`,
+              shortName: c.name,
+              lat: c.lat,
+              lon: c.lon,
+              type: "food",
+            });
+            if (picked.length >= maxFoodResults) break;
+          }
+          if (picked.length > 0) return picked;
         }
-        if (picked.length > 0) return picked;
+      } catch {
+        // fall through to bounded Nominatim
       }
-    } catch {
-      // fall through to Nominatim
     }
   }
 
-  // 2. Bounded Nominatim search near start (handles addresses, neighborhoods, directional sub-areas)
-  const delta = 0.14; // ~15km box
+  // 2. Bounded Nominatim search near start (handles addresses, neighborhoods, directional sub-areas, & local keyword fallback)
+  const delta = 0.16; // ~17km box
   const viewbox = `${start.lon - delta},${start.lat + delta},${start.lon + delta},${start.lat - delta}`;
 
-  const queryNominatim = async (q: string) => {
-    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=6&viewbox=${viewbox}`;
+  const queryNominatim = async (q: string, bounded: boolean) => {
+    const boundParam = bounded ? "&bounded=1" : "";
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=8&viewbox=${viewbox}${boundParam}`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(5500),
     });
     if (!res.ok) return [];
-    return (await res.json()) as {
+    const raw = (await res.json()) as {
       display_name: string;
       lat: string;
       lon: string;
@@ -560,10 +689,22 @@ async function resolveEndPlaces(
       category?: string;
       type?: string;
     }[];
+    // Never accept results outside reasonable running range (prevents cross-country/ocean matches)
+    return raw.filter(
+      (it) =>
+        haversineMeters(start, {
+          lat: parseFloat(it.lat),
+          lon: parseFloat(it.lon),
+        }) <= maxAllowedDist
+    );
   };
 
   try {
-    const items = await queryNominatim(endQuery);
+    let items = await queryNominatim(endQuery, true);
+    if (items.length === 0) {
+      items = await queryNominatim(endQuery, false);
+    }
+
     const areaMatch = items.find(
       (it) =>
         (it.category && AREA_CATEGORIES.has(it.category)) ||
@@ -580,7 +721,10 @@ async function resolveEndPlaces(
     if (dirMatch && !areaMatch) {
       const dirWord = dirMatch[1].toLowerCase();
       const baseArea = dirMatch[2].trim();
-      const baseItems = await queryNominatim(baseArea);
+      let baseItems = await queryNominatim(baseArea, true);
+      if (baseItems.length === 0) {
+        baseItems = await queryNominatim(baseArea, false);
+      }
       const baseNeighborhood = baseItems.find(
         (it) =>
           (it.category && AREA_CATEGORIES.has(it.category)) ||
@@ -627,6 +771,36 @@ async function resolveEndPlaces(
         })
         .sort((a, b) => a.rankPenalty - b.rankPenalty);
 
+      if (foodQuery) {
+        const picked: PlaceSuggestion[] = [];
+        for (const { it } of sorted) {
+          const lat = parseFloat(it.lat);
+          const lon = parseFloat(it.lon);
+          const shortName =
+            it.name ||
+            it.display_name
+              .split(",")
+              .slice(0, 2)
+              .map((s) => s.trim())
+              .join(", ");
+          const isDup = picked.some(
+            (p) =>
+              p.shortName.toLowerCase() === shortName.toLowerCase() ||
+              haversineMeters(p, { lat, lon }) < 100
+          );
+          if (isDup) continue;
+          picked.push({
+            label: it.display_name,
+            shortName,
+            lat,
+            lon,
+            type: "food",
+          });
+          if (picked.length >= maxFoodResults) break;
+        }
+        if (picked.length > 0) return picked;
+      }
+
       const top = sorted[0].it;
       const shortName =
         top.name ||
@@ -647,6 +821,19 @@ async function resolveEndPlaces(
     }
   } catch {
     // ignore
+  }
+
+  // 3. Final fuzzy keyword fallback via Google Places (handles non-food keywords like "bookstore", "farmers market", "falafel")
+  if (!foodQuery && process.env.GOOGLE_PLACES_API_KEY) {
+    const fuzzySpots = await resolveFoodViaGooglePlaces(
+      start,
+      endQuery,
+      idealMeters,
+      searchRadius,
+      maxFoodResults,
+      clientIp
+    );
+    if (fuzzySpots.length > 0) return fuzzySpots;
   }
 
   return [];
@@ -1213,6 +1400,11 @@ export async function POST(req: NextRequest) {
       ? Math.min((minMiles + maxMiles) / 2, 30)
       : null;
 
+    const clientIp =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+      req.headers.get("x-real-ip")?.trim() ||
+      "unknown";
+
     // Resolve end destination(s) if user typed a food craving, neighborhood, or address
     let resolvedEnds: PlaceSuggestion[] = endPlace ? [endPlace] : [];
     if (resolvedEnds.length === 0 && endQuery && endQuery.trim().length > 0) {
@@ -1220,7 +1412,8 @@ export async function POST(req: NextRequest) {
         start,
         endQuery.trim(),
         desiredMiles,
-        4
+        4,
+        clientIp
       );
     }
     const resolvedEnd: PlaceSuggestion | null = resolvedEnds[0] || null;
