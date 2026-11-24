@@ -7,7 +7,7 @@ import {
 import { saveSharedRoute } from "@/lib/share-store";
 import type { RunRoute } from "@/lib/types";
 
-const MAX_BODY_BYTES = 64 * 1024; // 64 KB cap
+const MAX_BODY_BYTES = 160 * 1024; // 160 KB cap for full high-res route coordinates
 
 export async function POST(req: NextRequest) {
   try {

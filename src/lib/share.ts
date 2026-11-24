@@ -1,8 +1,7 @@
-import type { RunRoute } from "./types";
+import type { RunRoute, ScenicPOI } from "./types";
 
 /**
- * Compact payload stored in URL query param `?d=...` so shared iMessage links
- * are completely stateless and always render rich Open Graph previews.
+ * Compact payload stored for shared routes (server-backed `/r/[id]` or legacy `?d=...`).
  */
 export interface SharedRoutePayload {
   id: string;
@@ -17,17 +16,31 @@ export interface SharedRoutePayload {
   sceneryScore: number;
   nightScore?: number;
   nightLabel?: "Well Lit" | "Moderate Light" | "Low Light";
+  uniquePathPct?: number;
+  trafficLights?: number;
+  waterFountains?: number;
+  restrooms?: number;
+  lapInfo?: {
+    laps: number;
+    featureName: string;
+    kind: "track" | "park-loop";
+  };
   carFreePct: number;
   quietStreetPct: number;
   mainRoadPct: number;
   highlights: string[];
   startLabel: string;
+  startFullLabel?: string;
   startLat: number;
   startLon: number;
   endLabel: string;
+  endFullLabel?: string;
   endLat: number;
   endLon: number;
+  endRating?: number;
+  endRatingCount?: number;
   foodOrArea?: string;
+  pois?: ScenicPOI[];
   /** Downsampled [lat, lon] pairs rounded to 4 decimals (~11m precision) */
   coords: [number, number][];
 }
@@ -55,7 +68,10 @@ export function downsampleCoordinates(
   return result;
 }
 
-export function toSharedRoutePayload(route: RunRoute): SharedRoutePayload {
+export function toSharedRoutePayload(
+  route: RunRoute,
+  maxPoints = 160
+): SharedRoutePayload {
   return {
     id: route.id,
     name: route.name,
@@ -69,18 +85,34 @@ export function toSharedRoutePayload(route: RunRoute): SharedRoutePayload {
     sceneryScore: route.sceneryScore,
     nightScore: route.nightScore,
     nightLabel: route.nightLabel,
+    uniquePathPct: route.uniquePathPct,
+    trafficLights: route.trafficLights,
+    waterFountains: route.waterFountains,
+    restrooms: route.restrooms,
+    lapInfo: route.lapInfo,
     carFreePct: route.surfaceBreakdown.carFreePct,
     quietStreetPct: route.surfaceBreakdown.quietStreetPct,
     mainRoadPct: route.surfaceBreakdown.mainRoadPct,
     highlights: route.highlights.slice(0, 4),
     startLabel: route.start.shortName,
+    startFullLabel:
+      route.start.label && route.start.label !== route.start.shortName
+        ? route.start.label
+        : undefined,
     startLat: Math.round(route.start.lat * 10000) / 10000,
     startLon: Math.round(route.start.lon * 10000) / 10000,
     endLabel: route.end.shortName,
+    endFullLabel:
+      route.end.label && route.end.label !== route.end.shortName
+        ? route.end.label
+        : undefined,
     endLat: Math.round(route.end.lat * 10000) / 10000,
     endLon: Math.round(route.end.lon * 10000) / 10000,
+    endRating: route.end.rating,
+    endRatingCount: route.end.ratingCount,
     foodOrArea: route.destinationFoodOrArea,
-    coords: downsampleCoordinates(route.coordinates, 48),
+    pois: (route.pois || []).slice(0, 5),
+    coords: downsampleCoordinates(route.coordinates, maxPoints),
   };
 }
 
@@ -100,6 +132,11 @@ export function payloadToRunRoute(p: SharedRoutePayload): RunRoute | null {
     sceneryScore: p.sceneryScore,
     nightScore: p.nightScore,
     nightLabel: p.nightLabel,
+    uniquePathPct: p.uniquePathPct,
+    trafficLights: p.trafficLights,
+    waterFountains: p.waterFountains,
+    restrooms: p.restrooms,
+    lapInfo: p.lapInfo,
     surfaceBreakdown: {
       carFreePct: p.carFreePct ?? p.trafficFreePct,
       quietStreetPct: p.quietStreetPct ?? Math.max(0, 100 - p.trafficFreePct),
@@ -107,25 +144,27 @@ export function payloadToRunRoute(p: SharedRoutePayload): RunRoute | null {
     },
     highlights: p.highlights || [],
     start: {
-      label: p.startLabel,
+      label: p.startFullLabel || p.startLabel,
       shortName: p.startLabel,
       lat: p.startLat,
       lon: p.startLon,
     },
     end: {
-      label: p.endLabel,
+      label: p.endFullLabel || p.endLabel,
       shortName: p.endLabel,
       lat: p.endLat,
       lon: p.endLon,
+      rating: p.endRating,
+      ratingCount: p.endRatingCount,
     },
     destinationFoodOrArea: p.foodOrArea,
     coordinates: p.coords,
-    pois: [],
+    pois: p.pois || [],
   };
 }
 
 export function encodeRouteToToken(route: RunRoute): string {
-  const payload = toSharedRoutePayload(route);
+  const payload = toSharedRoutePayload(route, 48);
   const json = JSON.stringify(payload);
   // UTF-8 safe base64url encoding (works in Node and all browsers; avoids Buffer polyfill lacking "base64url")
   if (typeof Buffer !== "undefined" && typeof window === "undefined") {

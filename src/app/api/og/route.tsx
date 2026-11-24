@@ -279,8 +279,12 @@ export async function GET(req: NextRequest) {
               }}
             >
               {route.mode === "point-to-point"
-                ? `${route.start.shortName} -> ${route.end.shortName}`
-                : route.start.shortName}
+                ? `${route.start.shortName} -> ${route.end.shortName}${
+                    route.end.rating != null
+                      ? ` (${route.end.rating.toFixed(1)}★)`
+                      : ""
+                  }`
+                : `Loop from & back to ${route.start.shortName}`}
             </div>
 
             {/* Key Metrics */}
@@ -351,7 +355,7 @@ export async function GET(req: NextRequest) {
             </div>
           </div>
 
-          {/* Footer Highlights */}
+          {/* Footer Highlights & Extra Stats */}
           <div
             style={{
               display: "flex",
@@ -361,7 +365,37 @@ export async function GET(req: NextRequest) {
               alignItems: "center",
             }}
           >
-            {route.highlights.slice(0, 3).map((h, i) => (
+            {route.elevationGainFt != null && (
+              <div
+                style={{
+                  display: "flex",
+                  backgroundColor: "#F1F5F9",
+                  color: "#334155",
+                  padding: "8px 14px",
+                  borderRadius: "10px",
+                  fontSize: "16px",
+                  fontWeight: 600,
+                }}
+              >
+                {`+${route.elevationGainFt} ft${route.terrainLabel ? ` · ${route.terrainLabel}` : ""}`}
+              </div>
+            )}
+            {route.nightLabel && (
+              <div
+                style={{
+                  display: "flex",
+                  backgroundColor: "#EEF2FF",
+                  color: "#3730A3",
+                  padding: "8px 14px",
+                  borderRadius: "10px",
+                  fontSize: "16px",
+                  fontWeight: 600,
+                }}
+              >
+                {route.nightLabel}
+              </div>
+            )}
+            {route.highlights.slice(0, 2).map((h, i) => (
               <div
                 key={i}
                 style={{

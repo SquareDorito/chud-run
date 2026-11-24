@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type L from "leaflet";
 import type { PlaceSuggestion, RunRoute } from "@/lib/types";
 
@@ -24,6 +24,7 @@ export default function RouteMap({
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const leafletRef = useRef<typeof L | null>(null);
   const initialCenterRef = useRef(center);
+  const [mapReady, setMapReady] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,12 +60,14 @@ export default function RouteMap({
       const group = leaflet.layerGroup().addTo(map);
       mapRef.current = map;
       layerGroupRef.current = group;
+      setMapReady(true);
     }
 
     init();
 
     return () => {
       cancelled = true;
+      setMapReady(false);
       if (mapRef.current) {
         mapRef.current.remove();
         mapRef.current = null;
@@ -74,6 +77,7 @@ export default function RouteMap({
   }, []);
 
   useEffect(() => {
+    if (!mapReady) return;
     const map = mapRef.current;
     const group = layerGroupRef.current;
     const leaflet = leafletRef.current;
@@ -201,10 +205,11 @@ export default function RouteMap({
           .addTo(group);
       }
 
+      map.invalidateSize();
       const bounds = leaflet.latLngBounds(activeRoute.coordinates);
       map.fitBounds(bounds, { padding: [48, 48], maxZoom: 16 });
     }
-  }, [routes, activeRouteId, startLocation, center, onSelectRoute]);
+  }, [mapReady, routes, activeRouteId, startLocation, center, onSelectRoute]);
 
   return <div ref={containerRef} className="w-full h-full z-0" />;
 }
