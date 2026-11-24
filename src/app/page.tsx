@@ -29,12 +29,45 @@ export default function HomePage() {
   const [selectedStart, setSelectedStart] = useState<PlaceSuggestion | null>(
     null
   );
+  const [startText, setStartText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [shareRoute, setShareRoute] = useState<RunRoute | null>(null);
   const [mobileSheetExpanded, setMobileSheetExpanded] = useState(true);
   const searchAbortRef = useRef<AbortController | null>(null);
+  const mapPickSeqRef = useRef(0);
+
+  const handleMapPickStart = (lat: number, lon: number) => {
+    const seq = ++mapPickSeqRef.current;
+    const coordLabel = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    const instantPlace: PlaceSuggestion = {
+      label: coordLabel,
+      shortName: "Dropped Pin",
+      lat,
+      lon,
+    };
+    setSelectedStart(instantPlace);
+    setStartText("Dropped Pin");
+    setRoutes([]);
+    setError(null);
+    setNote(null);
+
+    // Resolve street name asynchronously without blocking pin placement
+    fetch(`/api/geocode?lat=${lat}&lon=${lon}`)
+      .then((res) => res.json())
+      .then((data: { places?: PlaceSuggestion[] }) => {
+        if (mapPickSeqRef.current !== seq) return;
+        const resolved = data.places?.[0];
+        if (resolved) {
+          setSelectedStart(resolved);
+          setStartText(resolved.shortName);
+        }
+      })
+      .catch(() => {
+        // keep Dropped Pin fallback
+      });
+  };
 
   const handleSearch = async (params: {
     start: PlaceSuggestion;
@@ -141,7 +174,14 @@ export default function HomePage() {
         <div className="flex-1 overflow-y-auto p-5 space-y-5">
           <SearchPanel
             onSearch={handleSearch}
+            startText={startText}
+            selectedStart={selectedStart}
+            onStartTextChange={(text) => {
+              mapPickSeqRef.current++;
+              setStartText(text);
+            }}
             onStartChange={(start) => {
+              mapPickSeqRef.current++;
               setSelectedStart(start);
               if (!start) setRoutes([]);
             }}
@@ -225,6 +265,7 @@ export default function HomePage() {
           routes={visibleRoutes}
           activeRouteId={activeRouteId}
           startLocation={selectedStart}
+          onPickStart={handleMapPickStart}
           onSelectRoute={(id) => setActiveRouteId(id)}
         />
       </main>

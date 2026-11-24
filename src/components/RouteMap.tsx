@@ -8,6 +8,7 @@ interface RouteMapProps {
   routes: RunRoute[];
   activeRouteId: string | null;
   onSelectRoute?: (id: string) => void;
+  onPickStart?: (lat: number, lon: number) => void;
   startLocation?: PlaceSuggestion | null;
   center?: [number, number];
 }
@@ -16,6 +17,7 @@ export default function RouteMap({
   routes,
   activeRouteId,
   onSelectRoute,
+  onPickStart,
   startLocation,
   center = [40.7681, -73.9819], // Central Park South default before user picks start
 }: RouteMapProps) {
@@ -24,7 +26,17 @@ export default function RouteMap({
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const leafletRef = useRef<typeof L | null>(null);
   const initialCenterRef = useRef(center);
+  const onPickStartRef = useRef(onPickStart);
+  const hasRoutesRef = useRef(routes.length > 0);
   const [mapReady, setMapReady] = useState(false);
+
+  useEffect(() => {
+    onPickStartRef.current = onPickStart;
+  }, [onPickStart]);
+
+  useEffect(() => {
+    hasRoutesRef.current = routes.length > 0;
+  }, [routes.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -57,6 +69,11 @@ export default function RouteMap({
 
       leaflet.control.zoom({ position: "bottomright" }).addTo(map);
 
+      map.on("click", (e: L.LeafletMouseEvent) => {
+        if (!onPickStartRef.current || hasRoutesRef.current) return;
+        onPickStartRef.current(e.latlng.lat, e.latlng.lng);
+      });
+
       const group = leaflet.layerGroup().addTo(map);
       mapRef.current = map;
       layerGroupRef.current = group;
@@ -69,6 +86,8 @@ export default function RouteMap({
       cancelled = true;
       setMapReady(false);
       if (mapRef.current) {
+        mapRef.current.stop();
+        mapRef.current.off();
         mapRef.current.remove();
         mapRef.current = null;
         layerGroupRef.current = null;
@@ -81,8 +100,9 @@ export default function RouteMap({
     const map = mapRef.current;
     const group = layerGroupRef.current;
     const leaflet = leafletRef.current;
-    if (!map || !group || !leaflet) return;
+    if (!map || !group || !leaflet || !map.getContainer()?.isConnected) return;
 
+    map.stop();
     group.clearLayers();
 
     if (routes.length === 0) {
@@ -99,11 +119,11 @@ export default function RouteMap({
             direction: "top",
           })
           .addTo(group);
-        map.flyTo([startLocation.lat, startLocation.lon], 15, {
-          duration: 0.7,
+        map.setView([startLocation.lat, startLocation.lon], 15, {
+          animate: false,
         });
       } else {
-        map.setView(center, 13, { animate: true });
+        map.setView(center, 13, { animate: false });
       }
       return;
     }
@@ -205,11 +225,25 @@ export default function RouteMap({
           .addTo(group);
       }
 
-      map.invalidateSize();
+      map.invalidateSize({ animate: false });
       const bounds = leaflet.latLngBounds(activeRoute.coordinates);
-      map.fitBounds(bounds, { padding: [48, 48], maxZoom: 16 });
+      map.fitBounds(bounds, { padding: [48, 48], maxZoom: 16, animate: false });
     }
   }, [mapReady, routes, activeRouteId, startLocation, center, onSelectRoute]);
 
-  return <div ref={containerRef} className="w-full h-full z-0" />;
+  return (
+    <div className="relative w-full h-full">
+      <div
+        ref={containerRef}
+        className={`w-full h-full z-0 ${onPickStart && routes.length === 0 ? "cursor-crosshair" : ""}`}
+      />
+      {onPickStart && routes.length === 0 && (
+        <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-[400] px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-xs shadow-md border border-slate-200/80 text-[11px] font-semibold text-slate-700 whitespace-nowrap">
+          {startLocation
+            ? "Tap anywhere on the map to move Start"
+            : "Tap anywhere on the map to set Start"}
+        </div>
+      )}
+    </div>
+  );
 }

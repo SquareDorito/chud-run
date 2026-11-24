@@ -22,6 +22,8 @@ import type {
 } from "@/lib/types";
 
 const OSRM_FOOT_BASE = "https://routing.openstreetmap.de/routed-foot/route/v1/foot";
+const PUBLIC_VALHALLA_ROUTE_URL = "https://valhalla1.openstreetmap.de/route";
+let osrmCooldownUntil = 0;
 const OVERPASS_MIRRORS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
@@ -217,8 +219,7 @@ function extractParkTraversePoints(
   return { entry, interior, exit };
 }
 
-const OVERPASS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const OVERPASS_CACHE_MAX = 200;
+const OVERPASS_CACHE_MAX = 500;
 
 interface AreaContextData {
   pois: ScenicPOI[];
@@ -227,10 +228,26 @@ interface AreaContextData {
   envSignals: RouteEnvironmentSignals;
 }
 
-const areaContextCache = new Map<
-  string,
-  { expiresAt: number; data: AreaContextData }
->();
+const areaContextCache = new Map<string, AreaContextData>();
+
+function getAreaContextCache(key: string): AreaContextData | undefined {
+  const hit = areaContextCache.get(key);
+  if (!hit) return undefined;
+  // LRU refresh
+  areaContextCache.delete(key);
+  areaContextCache.set(key, hit);
+  return hit;
+}
+
+function setAreaContextCache(key: string, data: AreaContextData) {
+  if (areaContextCache.has(key)) {
+    areaContextCache.delete(key);
+  } else if (areaContextCache.size >= OVERPASS_CACHE_MAX) {
+    const oldest = areaContextCache.keys().next().value;
+    if (oldest) areaContextCache.delete(oldest);
+  }
+  areaContextCache.set(key, data);
+}
 
 function overpassGridKey(center: LatLng, radiusMeters: number): string {
   // ~1.5km grid cell + 2km radius bucket
@@ -263,9 +280,9 @@ async function fetchAreaContext(
   const r = Math.min(Math.max(Math.round(radiusMeters), 1800), 6500);
   const envR = Math.min(r, 4200);
   const cacheKey = overpassGridKey(center, r);
-  const cached = areaContextCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data;
+  const cached = getAreaContextCache(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   const query = `
@@ -398,14 +415,7 @@ async function fetchAreaContext(
         restrooms,
       },
     };
-    if (areaContextCache.size >= OVERPASS_CACHE_MAX) {
-      const oldest = areaContextCache.keys().next().value;
-      if (oldest) areaContextCache.delete(oldest);
-    }
-    areaContextCache.set(cacheKey, {
-      expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
-      data: result,
-    });
+    setAreaContextCache(cacheKey, result);
     return result;
   } catch {
     return emptyAreaContext();
@@ -565,6 +575,9 @@ async function resolveFoodViaGooglePlaces(
   let rawPlaces: CachedGooglePlace[] | null = null;
   const cached = googlePlacesCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
+    // LRU refresh on hit (keeps 24h TTL intact)
+    googlePlacesCache.delete(cacheKey);
+    googlePlacesCache.set(cacheKey, cached);
     rawPlaces = cached.places;
   } else {
     if (cached) googlePlacesCache.delete(cacheKey);
@@ -1265,9 +1278,10 @@ async function resolveEndPlaces(
 
 async function fetchValhallaFootRoute(
   waypoints: LatLng[],
-  elevationPref: ElevationPreference
+  elevationPref: ElevationPreference,
+  endpointUrl?: string
 ): Promise<OSRMRoute | null> {
-  const valhallaUrl = process.env.VALHALLA_URL?.trim();
+  const valhallaUrl = (endpointUrl ?? process.env.VALHALLA_URL)?.trim();
   if (!valhallaUrl) return null;
 
   const useHills =
@@ -1360,6 +1374,7 @@ async function fetchValhallaFootRoute(
 async function fetchOSRMFootRoute(
   waypoints: LatLng[]
 ): Promise<OSRMRoute | null> {
+  if (Date.now() < osrmCooldownUntil) return null;
   const coordStr = waypoints.map((p) => `${p.lon},${p.lat}`).join(";");
   const url = `${OSRM_FOOT_BASE}/${coordStr}?overview=full&geometries=geojson&steps=true`;
   try {
@@ -1367,7 +1382,12 @@ async function fetchOSRMFootRoute(
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(3500),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 429 || res.status >= 500) {
+        osrmCooldownUntil = Date.now() + 30_000;
+      }
+      return null;
+    }
     const data = (await res.json()) as {
       code?: string;
       routes?: OSRMRoute[];
@@ -1375,6 +1395,7 @@ async function fetchOSRMFootRoute(
     if (data.code !== "Ok" || !data.routes?.length) return null;
     return data.routes[0];
   } catch {
+    osrmCooldownUntil = Date.now() + 30_000;
     return null;
   }
 }
@@ -1383,11 +1404,24 @@ async function fetchFootRoute(
   waypoints: LatLng[],
   elevationPref: ElevationPreference = "any"
 ): Promise<OSRMRoute | null> {
-  if (process.env.VALHALLA_URL?.trim()) {
-    const valhallaRoute = await fetchValhallaFootRoute(waypoints, elevationPref);
+  const customValhalla = process.env.VALHALLA_URL?.trim();
+  if (customValhalla) {
+    const valhallaRoute = await fetchValhallaFootRoute(
+      waypoints,
+      elevationPref,
+      customValhalla
+    );
     if (valhallaRoute) return valhallaRoute;
   }
-  return fetchOSRMFootRoute(waypoints);
+  const osrmRoute = await fetchOSRMFootRoute(waypoints);
+  if (osrmRoute) return osrmRoute;
+
+  // Automatic fallback to public FOSSGIS Valhalla pedestrian router when OSRM is unavailable
+  return fetchValhallaFootRoute(
+    waypoints,
+    elevationPref,
+    PUBLIC_VALHALLA_ROUTE_URL
+  );
 }
 
 interface RouteEnvironmentSignals {

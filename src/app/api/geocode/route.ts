@@ -4,6 +4,7 @@ import type { PlaceSuggestion } from "@/lib/types";
 
 const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
 const PHOTON_BASE = "https://photon.komoot.io/api/";
+const PHOTON_REVERSE_BASE = "https://photon.komoot.io/reverse";
 const USER_AGENT = "ChudRun/1.0 (scenic running route planner)";
 
 const GEOCODE_FOOD_HINT_REGEX =
@@ -59,22 +60,26 @@ function queryTokenMatchScore(query: string, text: string): number {
   return matched / tokens.length;
 }
 
-const GEOCODE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const GEOCODE_CACHE_MAX = 400;
-const geocodeCache = new Map<
-  string,
-  { expiresAt: number; places: PlaceSuggestion[] }
->();
+const GEOCODE_CACHE_MAX = 800;
+const geocodeCache = new Map<string, PlaceSuggestion[]>();
+
+function getGeocodeCache(key: string): PlaceSuggestion[] | undefined {
+  const hit = geocodeCache.get(key);
+  if (!hit) return undefined;
+  // LRU refresh: move to most-recently-used position
+  geocodeCache.delete(key);
+  geocodeCache.set(key, hit);
+  return hit;
+}
 
 function setGeocodeCache(key: string, places: PlaceSuggestion[]) {
-  if (geocodeCache.size >= GEOCODE_CACHE_MAX) {
+  if (geocodeCache.has(key)) {
+    geocodeCache.delete(key);
+  } else if (geocodeCache.size >= GEOCODE_CACHE_MAX) {
     const oldest = geocodeCache.keys().next().value;
     if (oldest) geocodeCache.delete(oldest);
   }
-  geocodeCache.set(key, {
-    expiresAt: Date.now() + GEOCODE_CACHE_TTL_MS,
-    places,
-  });
+  geocodeCache.set(key, places);
 }
 
 interface NominatimItem {
@@ -273,6 +278,29 @@ async function searchNominatim(
   }
 }
 
+async function reversePhoton(
+  lat: number,
+  lon: number
+): Promise<PlaceSuggestion | null> {
+  try {
+    const url = `${PHOTON_REVERSE_BASE}?lat=${lat}&lon=${lon}&limit=1`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: AbortSignal.timeout(1800),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { features?: PhotonFeature[] };
+    const feat = data.features?.[0];
+    if (!feat) return null;
+    const formatted = formatPhotonPlace(feat);
+    if (!formatted) return null;
+    // Preserve exact user GPS/pin coordinates rather than snapped building centroid
+    return { ...formatted, lat, lon };
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const q = searchParams.get("q")?.trim();
@@ -283,15 +311,26 @@ export async function GET(req: NextRequest) {
     if (lat && lon) {
       const nLat = parseFloat(lat);
       const nLon = parseFloat(lon);
-      const revKey = `rev:${nLat.toFixed(4)},${nLon.toFixed(4)}`;
-      const cached = geocodeCache.get(revKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        return NextResponse.json({ places: cached.places });
+      if (Number.isNaN(nLat) || Number.isNaN(nLon)) {
+        return NextResponse.json({ places: [] }, { status: 200 });
       }
+      const revKey = `rev:${nLat.toFixed(4)},${nLon.toFixed(4)}`;
+      const cached = getGeocodeCache(revKey);
+      if (cached) {
+        return NextResponse.json({ places: cached });
+      }
+
+      // Photon reverse primary (~150ms); Nominatim fallback if Photon misses
+      const photonPlace = await reversePhoton(nLat, nLon);
+      if (photonPlace) {
+        setGeocodeCache(revKey, [photonPlace]);
+        return NextResponse.json({ places: [photonPlace] });
+      }
+
       const url = `${NOMINATIM_BASE}/reverse?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&format=jsonv2&addressdetails=1`;
       const res = await fetch(url, {
         headers: { "User-Agent": USER_AGENT },
-        signal: AbortSignal.timeout(3500),
+        signal: AbortSignal.timeout(3000),
       });
       if (!res.ok) {
         return NextResponse.json({ places: [] }, { status: 200 });
@@ -300,8 +339,8 @@ export async function GET(req: NextRequest) {
       const place: PlaceSuggestion = {
         label: item.display_name,
         shortName: formatShortName(item),
-        lat: parseFloat(item.lat),
-        lon: parseFloat(item.lon),
+        lat: nLat,
+        lon: nLon,
         type: item.type,
       };
       setGeocodeCache(revKey, [place]);
@@ -330,9 +369,9 @@ export async function GET(req: NextRequest) {
         : undefined;
 
     const cacheKey = `q:${q.toLowerCase()}|${nearLat != null ? nearLat.toFixed(2) : ""},${nearLon != null ? nearLon.toFixed(2) : ""}|${maxMiles != null ? maxMiles.toFixed(1) : ""}`;
-    const cached = geocodeCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return NextResponse.json({ places: cached.places });
+    const cached = getGeocodeCache(cacheKey);
+    if (cached) {
+      return NextResponse.json({ places: cached });
     }
 
     // Photon primary (fast typeahead + native proximity & bbox); Nominatim fallback for misses or exact street numbers

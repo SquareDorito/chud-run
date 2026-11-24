@@ -1,7 +1,11 @@
 "use client";
 
-import { Download, MessageCircle, Moon, Mountain, Trees } from "lucide-react";
-import { generateGPX } from "@/lib/share";
+import { Download, ExternalLink, MessageCircle, Moon, Mountain, Trees } from "lucide-react";
+import {
+  buildAppleMapsWalkingUrl,
+  buildGoogleMapsWalkingUrl,
+  generateGPX,
+} from "@/lib/share";
 import type { RunRoute } from "@/lib/types";
 
 interface RouteCardProps {
@@ -226,27 +230,51 @@ export default function RouteCard({
       )}
 
       {/* Actions */}
-      <div className="flex items-center gap-2 pt-1">
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onShare(route);
-          }}
-          className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-[#FC4C02] hover:bg-[#e34402] text-white text-xs font-bold transition shadow-xs"
-        >
-          <MessageCircle className="w-3.5 h-3.5" />
-          Share
-        </button>
-        <button
-          type="button"
-          onClick={handleDownloadGPX}
-          className="inline-flex items-center justify-center gap-1 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition"
-          title="Download GPX for Strava / Watch"
-        >
-          <Download className="w-3.5 h-3.5" />
-          GPX
-        </button>
+      <div className="space-y-1.5 pt-1">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onShare(route);
+            }}
+            className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-[#FC4C02] hover:bg-[#e34402] text-white text-xs font-bold transition shadow-xs cursor-pointer"
+          >
+            <MessageCircle className="w-3.5 h-3.5" />
+            Share
+          </button>
+          <button
+            type="button"
+            onClick={handleDownloadGPX}
+            className="inline-flex items-center justify-center gap-1 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition cursor-pointer"
+            title="Download GPX for Strava / Watch"
+          >
+            <Download className="w-3.5 h-3.5" />
+            GPX
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <a
+            href={buildGoogleMapsWalkingUrl(route)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center justify-center gap-1 py-1.5 px-2.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200/80 text-slate-700 text-[11px] font-semibold transition"
+          >
+            <ExternalLink className="w-3 h-3 text-slate-400" />
+            Google Maps
+          </a>
+          <a
+            href={buildAppleMapsWalkingUrl(route)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center justify-center gap-1 py-1.5 px-2.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200/80 text-slate-700 text-[11px] font-semibold transition"
+          >
+            <ExternalLink className="w-3 h-3 text-slate-400" />
+            Apple Maps
+          </a>
+        </div>
       </div>
     </div>
   );

@@ -30,29 +30,51 @@ interface SearchPanelProps {
     preferLoop: boolean;
     elevationPref: ElevationPreference;
   }) => void;
-  onStartChange?: (start: PlaceSuggestion | null) => void;
+  startText: string;
+  selectedStart: PlaceSuggestion | null;
+  onStartTextChange: (text: string) => void;
+  onStartChange: (start: PlaceSuggestion | null) => void;
   isLoading: boolean;
 }
 
 const SAVED_PLACES_KEY = "chudrun_saved_starts_v1";
+const LAST_GPS_KEY = "chudrun_last_gps_v1";
+const QUICK_END_CHIPS = ["Coffee", "Pizza", "Tacos", "Bakery", "Park"];
 const SLIDER_MIN = 1;
 const SLIDER_MAX = 15;
 const SPREAD_MILES = 2;
 
 export default function SearchPanel({
   onSearch,
+  startText,
+  selectedStart,
+  onStartTextChange,
   onStartChange,
   isLoading,
 }: SearchPanelProps) {
-  const [startText, setStartText] = useState("");
-  const [selectedStart, setSelectedStart] = useState<PlaceSuggestion | null>(
-    null
-  );
   const [startSuggestions, setStartSuggestions] = useState<PlaceSuggestion[]>(
     []
   );
   const [showStartDropdown, setShowStartDropdown] = useState(false);
   const [locating, setLocating] = useState(false);
+  const [gpsError, setGpsError] = useState<string | null>(null);
+
+  // Last known GPS coords for soft local biasing on Start Location autocomplete
+  const [lastGps, setLastGps] = useState<{ lat: number; lon: number } | null>(
+    () => {
+      if (typeof window === "undefined") return null;
+      try {
+        const raw = localStorage.getItem(LAST_GPS_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as { lat?: number; lon?: number };
+        return typeof parsed.lat === "number" && typeof parsed.lon === "number"
+          ? { lat: parsed.lat, lon: parsed.lon }
+          : null;
+      } catch {
+        return null;
+      }
+    }
+  );
 
   // Saved start labels (e.g. "Home", "Work")
   const [savedStarts, setSavedStarts] = useState<SavedPlace[]>(() => {
@@ -86,11 +108,18 @@ export default function SearchPanel({
   const endTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sliderTrackRef = useRef<HTMLDivElement | null>(null);
   const dragModeRef = useRef<"min" | "max" | "center" | null>(null);
+  const startWrapperRef = useRef<HTMLDivElement | null>(null);
+  const endWrapperRef = useRef<HTMLDivElement | null>(null);
+  const gpsSeqRef = useRef(0);
 
+  const setStartText = onStartTextChange;
   const selectStartPlace = (place: PlaceSuggestion | null) => {
-    setSelectedStart(place);
-    onStartChange?.(place);
+    onStartChange(place);
   };
+
+  // Soft proximity bias for Start autocomplete (last GPS or first saved label)
+  const startBiasLat = lastGps?.lat ?? savedStarts[0]?.place.lat;
+  const startBiasLon = lastGps?.lon ?? savedStarts[0]?.place.lon;
 
   const isAnyDistance = !useDistanceFilter;
   const effectiveEndMaxMiles = useDistanceFilter ? maxMiles : SLIDER_MAX;
@@ -156,7 +185,32 @@ export default function SearchPanel({
     persistSavedStarts(savedStarts.filter((s) => s.labelName !== labelName));
   };
 
-  // Debounced Start Autocomplete (cancels stale in-flight requests)
+  // Close Start & End dropdowns on outside click or Escape key
+  useEffect(() => {
+    const handlePointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (startWrapperRef.current && !startWrapperRef.current.contains(target)) {
+        setShowStartDropdown(false);
+      }
+      if (endWrapperRef.current && !endWrapperRef.current.contains(target)) {
+        setShowEndDropdown(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setShowStartDropdown(false);
+        setShowEndDropdown(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  // Debounced Start Autocomplete (soft local bias, cancels stale in-flight requests)
   useEffect(() => {
     if (startTimer.current) clearTimeout(startTimer.current);
     if (!startText.trim() || selectedStart?.shortName === startText) {
@@ -165,8 +219,12 @@ export default function SearchPanel({
     const controller = new AbortController();
     startTimer.current = setTimeout(async () => {
       try {
+        const bias =
+          startBiasLat != null && startBiasLon != null
+            ? `&nearLat=${startBiasLat}&nearLon=${startBiasLon}`
+            : "";
         const res = await fetch(
-          `/api/geocode?q=${encodeURIComponent(startText.trim())}`,
+          `/api/geocode?q=${encodeURIComponent(startText.trim())}${bias}`,
           { signal: controller.signal }
         );
         const data = (await res.json()) as { places?: PlaceSuggestion[] };
@@ -182,7 +240,7 @@ export default function SearchPanel({
       if (startTimer.current) clearTimeout(startTimer.current);
       controller.abort();
     };
-  }, [startText, selectedStart]);
+  }, [startText, selectedStart, startBiasLat, startBiasLon]);
 
   // Debounced End Autocomplete (bounded to start + slider max distance; cancels stale in-flight requests)
   useEffect(() => {
@@ -215,42 +273,80 @@ export default function SearchPanel({
   }, [endText, selectedEnd, selectedStart, effectiveEndMaxMiles]);
 
   const handleUseMyLocation = () => {
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) {
+      setGpsError("Location is not supported by this browser.");
+      return;
+    }
     setLocating(true);
+    setGpsError(null);
+    const seq = ++gpsSeqRef.current;
+
+    const applyPosition = (pos: GeolocationPosition) => {
+      const { latitude, longitude } = pos.coords;
+      const instantPlace: PlaceSuggestion = {
+        label: `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`,
+        shortName: "Current Location",
+        lat: latitude,
+        lon: longitude,
+      };
+      // Update map & input immediately without blocking on reverse geocoding
+      selectStartPlace(instantPlace);
+      setStartText("Current Location");
+      setShowStartDropdown(false);
+      setLocating(false);
+
+      const gpsCoords = { lat: latitude, lon: longitude };
+      setLastGps(gpsCoords);
+      try {
+        localStorage.setItem(LAST_GPS_KEY, JSON.stringify(gpsCoords));
+      } catch {
+        // ignore storage errors
+      }
+
+      // Fill in human-readable street name asynchronously in the background
+      fetch(`/api/geocode?lat=${latitude}&lon=${longitude}`)
+        .then((res) => res.json())
+        .then((data: { places?: PlaceSuggestion[] }) => {
+          if (gpsSeqRef.current !== seq) return;
+          const resolved = data.places?.[0];
+          if (resolved) {
+            selectStartPlace(resolved);
+            setStartText(resolved.shortName);
+          }
+        })
+        .catch(() => {
+          // keep Current Location fallback
+        });
+    };
+
+    const handleFinalError = (err: GeolocationPositionError) => {
+      setLocating(false);
+      if (err.code === err.PERMISSION_DENIED) {
+        setGpsError(
+          "Location access denied — enable it in browser settings, type an address, or tap the map."
+        );
+      } else {
+        setGpsError(
+          "Couldn't get a GPS lock — try again, type an address, or tap the map."
+        );
+      }
+    };
+
+    // Fast Wi-Fi/cached fix first (<200ms); fall back to high-accuracy GPS only if needed
     navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude, longitude } = pos.coords;
-        try {
-          const res = await fetch(
-            `/api/geocode?lat=${latitude}&lon=${longitude}`
-          );
-          const data = (await res.json()) as { places?: PlaceSuggestion[] };
-          const place = data.places?.[0] || {
-            label: "Current Location",
-            shortName: "Current Location",
-            lat: latitude,
-            lon: longitude,
-          };
-          selectStartPlace(place);
-          setStartText(place.shortName);
-          setShowStartDropdown(false);
-        } catch {
-          const fallback: PlaceSuggestion = {
-            label: "Current Location",
-            shortName: "Current Location",
-            lat: latitude,
-            lon: longitude,
-          };
-          selectStartPlace(fallback);
-          setStartText(fallback.shortName);
-        } finally {
-          setLocating(false);
+      applyPosition,
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) {
+          handleFinalError(err);
+          return;
         }
+        navigator.geolocation.getCurrentPosition(
+          applyPosition,
+          handleFinalError,
+          { enableHighAccuracy: true, maximumAge: 60_000, timeout: 6000 }
+        );
       },
-      () => {
-        setLocating(false);
-      },
-      { enableHighAccuracy: true, timeout: 7000 }
+      { enableHighAccuracy: false, maximumAge: 60_000, timeout: 4000 }
     );
   };
 
@@ -260,8 +356,12 @@ export default function SearchPanel({
 
     if (!startToUse && startText.trim()) {
       try {
+        const bias =
+          startBiasLat != null && startBiasLon != null
+            ? `&nearLat=${startBiasLat}&nearLon=${startBiasLon}`
+            : "";
         const res = await fetch(
-          `/api/geocode?q=${encodeURIComponent(startText.trim())}`
+          `/api/geocode?q=${encodeURIComponent(startText.trim())}${bias}`
         );
         const data = (await res.json()) as { places?: PlaceSuggestion[] };
         if (data.places?.[0]) {
@@ -298,7 +398,7 @@ export default function SearchPanel({
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
       {/* 1. START LOCATION (MANDATORY) */}
-      <div className="relative">
+      <div ref={startWrapperRef} className="relative">
         <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-500 mb-1.5">
           <span>
             Start Location <span className="text-[#FC4C02]">*</span>
@@ -337,11 +437,16 @@ export default function SearchPanel({
             required
             value={startText}
             onChange={(e) => {
+              gpsSeqRef.current++;
+              setGpsError(null);
               setStartText(e.target.value);
               selectStartPlace(null);
               setShowSaveInput(false);
             }}
             onFocus={() => {
+              if (startSuggestions.length > 0) setShowStartDropdown(true);
+            }}
+            onClick={() => {
               if (startSuggestions.length > 0) setShowStartDropdown(true);
             }}
             placeholder="Address, park, or saved label..."
@@ -351,6 +456,8 @@ export default function SearchPanel({
             <button
               type="button"
               onClick={() => {
+                gpsSeqRef.current++;
+                setGpsError(null);
                 setStartText("");
                 selectStartPlace(null);
                 setStartSuggestions([]);
@@ -362,6 +469,21 @@ export default function SearchPanel({
             </button>
           )}
         </div>
+
+        {/* GPS Error Feedback */}
+        {gpsError && (
+          <div className="mt-1.5 flex items-center justify-between gap-2 rounded-lg bg-amber-50 border border-amber-200 px-2.5 py-1.5 text-[11px] text-amber-800">
+            <span>{gpsError}</span>
+            <button
+              type="button"
+              onClick={() => setGpsError(null)}
+              className="text-amber-700 hover:text-amber-900 shrink-0 cursor-pointer"
+              aria-label="Dismiss GPS error"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Inline Save Label Prompt */}
         {showSaveInput && selectedStart && (
@@ -402,6 +524,8 @@ export default function SearchPanel({
                   <button
                     type="button"
                     onClick={() => {
+                      gpsSeqRef.current++;
+                      setGpsError(null);
                       selectStartPlace(item.place);
                       setStartText(item.place.shortName);
                       setShowStartDropdown(false);
@@ -432,6 +556,8 @@ export default function SearchPanel({
                 key={`${place.lat}-${place.lon}-${idx}`}
                 type="button"
                 onClick={() => {
+                  gpsSeqRef.current++;
+                  setGpsError(null);
                   selectStartPlace(place);
                   setStartText(place.shortName);
                   setShowStartDropdown(false);
@@ -597,7 +723,7 @@ export default function SearchPanel({
       </div>
 
       {/* 3. END DESTINATION / FOOD / KEYWORD (OPTIONAL) */}
-      <div className="relative">
+      <div ref={endWrapperRef} className="relative">
         <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-500 mb-1.5">
           <label className="flex items-center gap-1">
             <Utensils className="w-3.5 h-3.5 text-slate-400" />
@@ -626,6 +752,9 @@ export default function SearchPanel({
             onFocus={() => {
               if (endText.trim().length >= 2) setShowEndDropdown(true);
             }}
+            onClick={() => {
+              if (endText.trim().length >= 2) setShowEndDropdown(true);
+            }}
             placeholder="Keyword (pizza, coffee, park) or specific place..."
             className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-[#FC4C02] focus:ring-2 focus:ring-[#FC4C02]/15 transition"
           />
@@ -644,6 +773,26 @@ export default function SearchPanel({
             </button>
           )}
         </div>
+
+        {/* Quick one-tap keyword chips when End input is empty */}
+        {!endText.trim() && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {QUICK_END_CHIPS.map((chip) => (
+              <button
+                key={chip}
+                type="button"
+                onClick={() => {
+                  setEndText(chip);
+                  setSelectedEnd(null);
+                  setShowEndDropdown(false);
+                }}
+                className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-slate-100 hover:bg-orange-50 hover:text-[#FC4C02] text-slate-600 transition cursor-pointer"
+              >
+                {chip}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Inline mode hint or out-of-range warning */}
         {selectedEndOutOfRange && selectedEnd && (
