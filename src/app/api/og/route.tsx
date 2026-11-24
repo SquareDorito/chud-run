@@ -254,6 +254,7 @@ export async function GET(req: NextRequest) {
             {/* Route Name */}
             <div
               style={{
+                display: "flex",
                 fontSize: "38px",
                 fontWeight: 800,
                 color: "#111827",
@@ -265,13 +266,15 @@ export async function GET(req: NextRequest) {
             </div>
             <div
               style={{
+                display: "flex",
                 fontSize: "20px",
                 color: "#64748B",
                 marginBottom: "30px",
               }}
             >
-              {route.start.shortName}
-              {route.mode === "point-to-point" ? ` → ${route.end.shortName}` : ""}
+              {route.mode === "point-to-point"
+                ? `${route.start.shortName} -> ${route.end.shortName}`
+                : route.start.shortName}
             </div>
 
             {/* Key Metrics */}
@@ -294,11 +297,11 @@ export async function GET(req: NextRequest) {
                   border: "1px solid #E2E8F0",
                 }}
               >
-                <span style={{ fontSize: "15px", color: "#64748B", fontWeight: 600 }}>
+                <span style={{ display: "flex", fontSize: "15px", color: "#64748B", fontWeight: 600 }}>
                   DISTANCE
                 </span>
-                <span style={{ fontSize: "34px", fontWeight: 800, color: "#111827" }}>
-                  {route.distanceMiles.toFixed(1)} mi
+                <span style={{ display: "flex", fontSize: "34px", fontWeight: 800, color: "#111827" }}>
+                  {`${route.distanceMiles.toFixed(1)} mi`}
                 </span>
               </div>
 
@@ -313,11 +316,11 @@ export async function GET(req: NextRequest) {
                   border: "1px solid #A7F3D0",
                 }}
               >
-                <span style={{ fontSize: "15px", color: "#047857", fontWeight: 600 }}>
+                <span style={{ display: "flex", fontSize: "15px", color: "#047857", fontWeight: 600 }}>
                   TRAFFIC-FREE
                 </span>
-                <span style={{ fontSize: "34px", fontWeight: 800, color: "#065F46" }}>
-                  {route.trafficFreePct}%
+                <span style={{ display: "flex", fontSize: "34px", fontWeight: 800, color: "#065F46" }}>
+                  {`${route.trafficFreePct}%`}
                 </span>
               </div>
 
@@ -332,11 +335,11 @@ export async function GET(req: NextRequest) {
                   border: "1px solid #FED7AA",
                 }}
               >
-                <span style={{ fontSize: "15px", color: "#C2410C", fontWeight: 600 }}>
+                <span style={{ display: "flex", fontSize: "15px", color: "#C2410C", fontWeight: 600 }}>
                   SCENERY
                 </span>
-                <span style={{ fontSize: "34px", fontWeight: 800, color: "#9A3412" }}>
-                  {route.sceneryScore}/100
+                <span style={{ display: "flex", fontSize: "34px", fontWeight: 800, color: "#9A3412" }}>
+                  {`${route.sceneryScore}/100`}
                 </span>
               </div>
             </div>
@@ -356,6 +359,7 @@ export async function GET(req: NextRequest) {
               <div
                 key={i}
                 style={{
+                  display: "flex",
                   backgroundColor: "#F1F5F9",
                   color: "#334155",
                   padding: "8px 14px",

@@ -112,7 +112,7 @@ export async function fetchRouteElevationStats(
 } | null> {
   if (coords.length < 2) return null;
 
-  const sampleCount = Math.min(18, coords.length);
+  const sampleCount = Math.min(14, coords.length);
   const step = (coords.length - 1) / (sampleCount - 1);
   const lats: number[] = [];
   const lons: number[] = [];
@@ -125,7 +125,7 @@ export async function fetchRouteElevationStats(
 
   try {
     const url = `https://api.open-meteo.com/v1/elevation?latitude=${lats.join(",")}&longitude=${lons.join(",")}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(3500) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
     if (!res.ok) return null;
     const data = (await res.json()) as { elevation?: number[] };
     const elevs = data.elevation;

@@ -185,6 +185,27 @@ function extractParkTraversePoints(
   return { entry, interior, exit };
 }
 
+const OVERPASS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const OVERPASS_CACHE_MAX = 200;
+
+const scenicFeatureCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    data: { pois: ScenicPOI[]; parks: ParkGeometry[]; tracks: TrackGeometry[] };
+  }
+>();
+
+const envSignalsCache = new Map<
+  string,
+  { expiresAt: number; data: RouteEnvironmentSignals }
+>();
+
+function overpassGridKey(center: LatLng, radiusMeters: number): string {
+  // ~1.5km grid cell + 2km radius bucket
+  return `${Math.round(center.lat * 67)},${Math.round(center.lon * 67)}|${Math.round(radiusMeters / 2000)}`;
+}
+
 async function fetchScenicAndRoutingFeatures(
   center: LatLng,
   radiusMeters: number
@@ -193,19 +214,25 @@ async function fetchScenicAndRoutingFeatures(
   parks: ParkGeometry[];
   tracks: TrackGeometry[];
 }> {
-  const r = Math.min(Math.max(Math.round(radiusMeters), 1800), 10000);
+  const r = Math.min(Math.max(Math.round(radiusMeters), 1800), 6500);
+  const cacheKey = overpassGridKey(center, r);
+  const cached = scenicFeatureCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
   const query = `
-    [out:json][timeout:7];
+    [out:json][timeout:3];
     (
       node["leisure"~"park|nature_reserve|garden"](around:${r},${center.lat},${center.lon});
       way["leisure"~"park|nature_reserve|garden"](around:${r},${center.lat},${center.lon});
-      way["leisure"="track"](around:${Math.min(r, 4500)},${center.lat},${center.lon});
+      way["leisure"="track"](around:${Math.min(r, 4000)},${center.lat},${center.lon});
       node["tourism"~"viewpoint|attraction"](around:${r},${center.lat},${center.lon});
       node["historic"~"monument|memorial"](around:${r},${center.lat},${center.lon});
       way["waterway"~"river|canal"](around:${r},${center.lat},${center.lon});
       way["natural"="water"](around:${r},${center.lat},${center.lon});
     );
-    out center geom 55;
+    out center geom 45;
   `;
 
   try {
@@ -216,7 +243,7 @@ async function fetchScenicAndRoutingFeatures(
         "User-Agent": USER_AGENT,
       },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(7000),
+      signal: AbortSignal.timeout(2600),
     });
 
     if (!res.ok) return { pois: [], parks: [], tracks: [] };
@@ -286,7 +313,16 @@ async function fetchScenicAndRoutingFeatures(
 
       pois.push({ name, category, lat, lon });
     }
-    return { pois, parks, tracks };
+    const result = { pois, parks, tracks };
+    if (scenicFeatureCache.size >= OVERPASS_CACHE_MAX) {
+      const oldest = scenicFeatureCache.keys().next().value;
+      if (oldest) scenicFeatureCache.delete(oldest);
+    }
+    scenicFeatureCache.set(cacheKey, {
+      expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
+      data: result,
+    });
+    return result;
   } catch {
     return { pois: [], parks: [], tracks: [] };
   }
@@ -431,13 +467,13 @@ async function resolveFoodViaGooglePlaces(
   endQuery: string,
   idealMeters: number,
   searchRadius: number,
+  maxAllowedDist: number,
   maxResults = 4,
   clientIp = "unknown"
 ): Promise<PlaceSuggestion[]> {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return [];
 
-  const maxAllowedDist = Math.max(searchRadius * 2.2, 22000);
   const clampedRadius = Math.min(searchRadius, 15000);
   // ~1.1km grid cell + normalized query + 2km radius bucket
   const cacheKey = `${Math.round(start.lat * 100)},${Math.round(start.lon * 100)}|${endQuery.toLowerCase().trim()}|${Math.round(clampedRadius / 2000)}`;
@@ -562,18 +598,110 @@ async function resolveFoodViaGooglePlaces(
   return results;
 }
 
+async function resolveFoodViaPhoton(
+  start: LatLng,
+  endQuery: string,
+  idealMeters: number,
+  minStraightMeters: number,
+  maxAllowedDist: number,
+  maxResults = 4
+): Promise<PlaceSuggestion[]> {
+  try {
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(endQuery)}&lat=${start.lat}&lon=${start.lon}&limit=25`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      features?: {
+        geometry?: { coordinates?: [number, number] };
+        properties?: {
+          name?: string;
+          osm_key?: string;
+          osm_value?: string;
+          street?: string;
+          city?: string;
+          district?: string;
+        };
+      }[];
+    };
+
+    const candidates = (data.features || [])
+      .map((f) => {
+        const coords = f.geometry?.coordinates;
+        const props = f.properties;
+        if (!coords || coords.length < 2 || !props?.name) return null;
+        const [lon, lat] = coords;
+        const dist = haversineMeters(start, { lat, lon });
+        if (dist > maxAllowedDist || dist < 120) return null;
+        const isFoodOsm =
+          props.osm_key === "amenity" ||
+          props.osm_key === "shop" ||
+          props.osm_key === "cuisine";
+        // Prefer spots close to idealMeters and inside [minStraightMeters, maxAllowedDist]
+        const rangeMissPenalty =
+          dist < minStraightMeters ? (minStraightMeters - dist) * 1.4 : 0;
+        const score =
+          Math.abs(dist - idealMeters) +
+          rangeMissPenalty -
+          (isFoodOsm ? 400 : 0);
+        return {
+          name: props.name,
+          area: props.district || props.city || props.street || "",
+          lat,
+          lon,
+          score,
+        };
+      })
+      .filter((c): c is NonNullable<typeof c> => c !== null)
+      .sort((a, b) => a.score - b.score);
+
+    const picked: PlaceSuggestion[] = [];
+    for (const c of candidates) {
+      const isDup = picked.some(
+        (p) =>
+          p.shortName.toLowerCase() === c.name.toLowerCase() ||
+          haversineMeters(p, c) < 120
+      );
+      if (isDup) continue;
+      picked.push({
+        label: c.area ? `${c.name} (${c.area})` : `${c.name} (${endQuery})`,
+        shortName: c.name,
+        lat: c.lat,
+        lon: c.lon,
+        type: "food",
+      });
+      if (picked.length >= maxResults) break;
+    }
+    return picked;
+  } catch {
+    return [];
+  }
+}
+
 async function resolveEndPlaces(
   start: LatLng,
   endQuery: string,
   targetMiles?: number | null,
   maxFoodResults = 4,
-  clientIp = "unknown"
+  clientIp = "unknown",
+  minMiles?: number | null,
+  maxMiles?: number | null
 ): Promise<PlaceSuggestion[]> {
+  // Running distance is ~1.22x straight-line distance, so ideal straight-line is ~0.78x targetMiles
   const idealMeters = targetMiles
-    ? milesToMeters(targetMiles) * 0.85
+    ? milesToMeters(targetMiles) * 0.78
     : 3200; // ~2 miles default for food/area runs
-  const searchRadius = Math.min(Math.max(Math.round(idealMeters * 1.45), 2500), 14000);
-  const maxAllowedDist = Math.max(searchRadius * 2.5, 25000);
+  const minStraightMeters =
+    typeof minMiles === "number" && minMiles > 0
+      ? milesToMeters(minMiles) * 0.55
+      : 300;
+  const maxAllowedDist =
+    typeof maxMiles === "number" && maxMiles > 0
+      ? Math.max(milesToMeters(maxMiles) * 0.92, 2500)
+      : Math.min(Math.max(Math.round(idealMeters * 1.6), 4500), 12000);
+  const searchRadius = Math.min(Math.round(maxAllowedDist * 1.05), 14000);
   const foodQuery = isFoodOrVibeQuery(endQuery);
 
   // 1a. If GOOGLE_PLACES_API_KEY is configured and this is a food query, rank top spots by live star ratings + reviews
@@ -583,25 +711,40 @@ async function resolveEndPlaces(
       endQuery,
       idealMeters,
       searchRadius,
+      maxAllowedDist,
       maxFoodResults,
       clientIp
     );
     if (ratedSpots.length > 0) return ratedSpots;
   }
 
-  // 1b. Keyless fuzzy food/drink search via Overpass (nodes + ways, synonym-expanded)
+  // 1b. Fast geo-biased keyless food/POI search via Photon (Komoot OSM)
+  if (foodQuery) {
+    const photonSpots = await resolveFoodViaPhoton(
+      start,
+      endQuery,
+      idealMeters,
+      minStraightMeters,
+      maxAllowedDist,
+      maxFoodResults
+    );
+    if (photonSpots.length > 0) return photonSpots;
+  }
+
+  // 1c. Keyless fuzzy food/drink fallback via Overpass (bounded fast node query)
   if (foodQuery) {
     const terms = expandFoodTerms(endQuery);
     const regexPattern = terms.join("|");
     if (regexPattern) {
+      const overRadius = Math.min(Math.round(maxAllowedDist), 9000);
       const overQuery = `
-        [out:json][timeout:7];
+        [out:json][timeout:6];
         (
-          nwr["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["name"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
-          nwr["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["cuisine"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
-          nwr["shop"~"bakery|coffee|pastry|deli|ice_cream"]["name"~"${regexPattern}",i](around:${searchRadius},${start.lat},${start.lon});
+          node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["name"~"${regexPattern}",i](around:${overRadius},${start.lat},${start.lon});
+          node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["cuisine"~"${regexPattern}",i](around:${overRadius},${start.lat},${start.lon});
+          node["shop"~"bakery|coffee|pastry|deli|ice_cream"]["name"~"${regexPattern}",i](around:${overRadius},${start.lat},${start.lon});
         );
-        out center 40;
+        out 40;
       `;
       try {
         const res = await fetch(OVERPASS_BASE, {
@@ -701,7 +844,7 @@ async function resolveEndPlaces(
 
   try {
     let items = await queryNominatim(endQuery, true);
-    if (items.length === 0) {
+    if (items.length === 0 && !foodQuery) {
       items = await queryNominatim(endQuery, false);
     }
 
@@ -830,6 +973,7 @@ async function resolveEndPlaces(
       endQuery,
       idealMeters,
       searchRadius,
+      maxAllowedDist,
       maxFoodResults,
       clientIp
     );
@@ -941,7 +1085,7 @@ async function fetchOSRMFootRoute(
   try {
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
-      signal: AbortSignal.timeout(7500),
+      signal: AbortSignal.timeout(3500),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as {
@@ -978,9 +1122,15 @@ async function fetchRouteEnvironmentSignals(
   center: LatLng,
   radiusMeters: number
 ): Promise<RouteEnvironmentSignals> {
-  const r = Math.min(Math.max(Math.round(radiusMeters), 1500), 7000);
+  const r = Math.min(Math.max(Math.round(radiusMeters), 1500), 4500);
+  const cacheKey = overpassGridKey(center, r);
+  const cached = envSignalsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
   const query = `
-    [out:json][timeout:6];
+    [out:json][timeout:3];
     (
       node["highway"="street_lamp"](around:${r},${center.lat},${center.lon});
       way["lit"="yes"](around:${r},${center.lat},${center.lon});
@@ -989,7 +1139,7 @@ async function fetchRouteEnvironmentSignals(
       node["amenity"="drinking_water"](around:${r},${center.lat},${center.lon});
       node["amenity"="toilets"](around:${r},${center.lat},${center.lon});
     );
-    out center 220;
+    out center 180;
   `;
 
   try {
@@ -1000,7 +1150,7 @@ async function fetchRouteEnvironmentSignals(
         "User-Agent": USER_AGENT,
       },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(5500),
+      signal: AbortSignal.timeout(2400),
     });
     if (!res.ok) {
       return {
@@ -1035,13 +1185,22 @@ async function fetchRouteEnvironmentSignals(
         litPoints.push({ lat, lon });
       }
     }
-    return {
+    const result: RouteEnvironmentSignals = {
       litPoints,
       unlitPoints,
       trafficSignals,
       waterFountains,
       restrooms,
     };
+    if (envSignalsCache.size >= OVERPASS_CACHE_MAX) {
+      const oldest = envSignalsCache.keys().next().value;
+      if (oldest) envSignalsCache.delete(oldest);
+    }
+    envSignalsCache.set(cacheKey, {
+      expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
+      data: result,
+    });
+    return result;
   } catch {
     return {
       litPoints: [],
@@ -1405,26 +1564,31 @@ export async function POST(req: NextRequest) {
       req.headers.get("x-real-ip")?.trim() ||
       "unknown";
 
-    // Resolve end destination(s) if user typed a food craving, neighborhood, or address
-    let resolvedEnds: PlaceSuggestion[] = endPlace ? [endPlace] : [];
-    if (resolvedEnds.length === 0 && endQuery && endQuery.trim().length > 0) {
-      resolvedEnds = await resolveEndPlaces(
-        start,
-        endQuery.trim(),
-        desiredMiles,
-        4,
-        clientIp
-      );
-    }
-    const resolvedEnd: PlaceSuggestion | null = resolvedEnds[0] || null;
-
-    const effectiveMiles = desiredMiles ?? (resolvedEnd ? 2.5 : 3.5);
+    // Run destination resolution IN PARALLEL with scenic features & environment signals
+    const effectiveMiles = desiredMiles ?? (endPlace || endQuery ? 2.5 : 3.5);
     const searchRadius = milesToMeters(effectiveMiles) * 0.75;
-    const [{ pois: scenicPois, parks, tracks }, envSignals] =
+
+    const resolveEndsPromise: Promise<PlaceSuggestion[]> = endPlace
+      ? Promise.resolve([endPlace])
+      : endQuery && endQuery.trim().length > 0
+        ? resolveEndPlaces(
+            start,
+            endQuery.trim(),
+            desiredMiles,
+            3,
+            clientIp,
+            minMiles,
+            maxMiles
+          )
+        : Promise.resolve([]);
+
+    const [resolvedEnds, { pois: scenicPois, parks, tracks }, envSignals] =
       await Promise.all([
+        resolveEndsPromise,
         fetchScenicAndRoutingFeatures(start, searchRadius),
         fetchRouteEnvironmentSignals(start, searchRadius),
       ]);
+    const resolvedEnd: PlaceSuggestion | null = resolvedEnds[0] || null;
 
     const routes: RunRoute[] = [];
 
@@ -1571,7 +1735,7 @@ export async function POST(req: NextRequest) {
           ];
 
           for (const arc of arcs) {
-            if (candidateWaypoints.length >= 9) break;
+            if (candidateWaypoints.length >= 6) break;
             const wp = destinationPoint(midPoint, sideDist * arc.mult, (brg + arc.angle) % 360);
             candidateWaypoints.push({
               name: arc.name,
@@ -1776,29 +1940,36 @@ export async function POST(req: NextRequest) {
           ? milesToMeters(maxMiles)
           : targetMeters * 1.12;
 
+      const inRangePass1Count = pass1Results.filter(
+        (osrm) => osrm && osrm.distance >= minTargetM && osrm.distance <= maxTargetM
+      ).length;
+
       const recalibrationTasks: {
         idx: number;
         promise: Promise<OSRMRoute | null>;
       }[] = [];
 
-      pass1Results.forEach((osrm, idx) => {
-        if (!osrm || !loopTemplates[idx].scalable) return;
-        if (recalibrationTasks.length >= 4) return;
-        const outOfRange =
-          osrm.distance < minTargetM || osrm.distance > maxTargetM;
-        if (!outOfRange || osrm.distance < 200) return;
+      // Skip Pass 2 completely if Pass 1 already produced >= 3 in-range loops; otherwise recalibrate at most 2
+      if (inRangePass1Count < 3) {
+        pass1Results.forEach((osrm, idx) => {
+          if (!osrm || !loopTemplates[idx].scalable) return;
+          if (recalibrationTasks.length >= 2) return;
+          const outOfRange =
+            osrm.distance < minTargetM || osrm.distance > maxTargetM;
+          if (!outOfRange || osrm.distance < 200) return;
 
-        const scale = Math.min(1.85, Math.max(0.55, targetMeters / osrm.distance));
-        const scaledWaypoints = loopTemplates[idx].waypoints.map((wp, wIdx) =>
-          wIdx === 0 || wIdx === loopTemplates[idx].waypoints.length - 1
-            ? wp
-            : scaleWaypointFromStart(start, wp, scale)
-        );
-        recalibrationTasks.push({
-          idx,
-          promise: fetchFootRoute(scaledWaypoints, elevationPref),
+          const scale = Math.min(1.85, Math.max(0.55, targetMeters / osrm.distance));
+          const scaledWaypoints = loopTemplates[idx].waypoints.map((wp, wIdx) =>
+            wIdx === 0 || wIdx === loopTemplates[idx].waypoints.length - 1
+              ? wp
+              : scaleWaypointFromStart(start, wp, scale)
+          );
+          recalibrationTasks.push({
+            idx,
+            promise: fetchFootRoute(scaledWaypoints, elevationPref),
+          });
         });
-      });
+      }
 
       const pass2Settled = await Promise.all(
         recalibrationTasks.map(async (task) => ({
@@ -1956,10 +2127,19 @@ export async function POST(req: NextRequest) {
 
     routes.sort((a, b) => scoreRoute(b) - scoreRoute(a));
 
+    // When a distance range is set for a fuzzy end query (e.g. "pizza" 6–8 mi), drop wildly out-of-range routes
+    const candidateRoutes =
+      hasRange && !endPlace && resolvedEnds.length > 0 && typeof maxMiles === "number"
+        ? (() => {
+            const withinCap = routes.filter((r) => r.distanceMiles <= maxMiles * 1.35);
+            return withinCap.length > 0 ? withinCap : routes;
+          })()
+        : routes;
+
     // Spatial polyline overlap deduplication: ensure top 9 routes are genuinely distinct corridors
     // (preserve routes going to different food destinations even if they share the start corridor)
     const uniqueRoutes: RunRoute[] = [];
-    for (const r of routes) {
+    for (const r of candidateRoutes) {
       const isDup = uniqueRoutes.some((u) => {
         const differentDestination =
           r.mode === "point-to-point" &&
