@@ -84,9 +84,13 @@ export function encodeRouteToToken(route: RunRoute): string {
   };
 
   const json = JSON.stringify(payload);
-  // UTF-8 safe base64url encoding (works in both Node and Browser)
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(json, "utf8").toString("base64url");
+  // UTF-8 safe base64url encoding (works in Node and all browsers; avoids Buffer polyfill lacking "base64url")
+  if (typeof Buffer !== "undefined" && typeof window === "undefined") {
+    return Buffer.from(json, "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
   }
   const bytes = new TextEncoder().encode(json);
   let binary = "";
@@ -98,12 +102,13 @@ export function encodeRouteToToken(route: RunRoute): string {
 
 export function decodeRouteFromToken(token: string): RunRoute | null {
   try {
+    const base64 = token.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
     let json: string;
-    if (typeof Buffer !== "undefined") {
-      json = Buffer.from(token, "base64url").toString("utf8");
+    if (typeof Buffer !== "undefined" && typeof window === "undefined") {
+      json = Buffer.from(padded, "base64").toString("utf8");
     } else {
-      const base64 = token.replace(/-/g, "+").replace(/_/g, "/");
-      const binary = atob(base64);
+      const binary = atob(padded);
       const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
       json = new TextDecoder().decode(bytes);
     }
