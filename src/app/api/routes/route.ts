@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   bearingDegrees,
+  computePolylineOverlap,
+  countNearbyPoints,
+  decodePolyline6,
   destinationPoint,
   fetchRouteElevationStats,
   findNearbyPOIs,
@@ -9,6 +12,7 @@ import {
   milesToMeters,
 } from "@/lib/geo";
 import type {
+  ElevationPreference,
   LatLng,
   PlaceSuggestion,
   RouteSearchRequest,
@@ -288,18 +292,178 @@ async function fetchScenicAndRoutingFeatures(
   }
 }
 
-async function resolveEndPlace(
+const DIRECTION_PREFIX_BEARINGS: Record<string, number> = {
+  north: 0,
+  northern: 0,
+  upper: 0,
+  east: 90,
+  eastern: 90,
+  south: 180,
+  southern: 180,
+  lower: 180,
+  west: 270,
+  western: 270,
+};
+
+const AREA_CATEGORIES = new Set(["place", "boundary"]);
+const AREA_TYPES = new Set([
+  "neighbourhood",
+  "neighborhood",
+  "suburb",
+  "quarter",
+  "city_district",
+  "borough",
+  "village",
+  "town",
+  "city",
+  "administrative",
+  "park",
+  "pier",
+]);
+const NOISE_POI_TYPES = new Set([
+  "school",
+  "kindergarten",
+  "dentist",
+  "clinic",
+  "hospital",
+  "doctors",
+  "office",
+  "company",
+  "pharmacy",
+  "parking",
+]);
+
+async function resolveFoodViaGooglePlaces(
   start: LatLng,
   endQuery: string,
-  targetMiles?: number | null
-): Promise<PlaceSuggestion | null> {
+  idealMeters: number,
+  searchRadius: number,
+  maxResults = 4
+): Promise<PlaceSuggestion[]> {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return [];
+
+  try {
+    const res = await fetch(
+      "https://places.googleapis.com/v1/places:searchText",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask":
+            "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.businessStatus",
+        },
+        body: JSON.stringify({
+          textQuery: endQuery,
+          maxResultCount: 12,
+          locationBias: {
+            circle: {
+              center: { latitude: start.lat, longitude: start.lon },
+              radius: Math.min(searchRadius, 15000),
+            },
+          },
+        }),
+        signal: AbortSignal.timeout(5500),
+      }
+    );
+
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      places?: {
+        displayName?: { text?: string };
+        formattedAddress?: string;
+        location?: { latitude?: number; longitude?: number };
+        rating?: number;
+        userRatingCount?: number;
+        businessStatus?: string;
+      }[];
+    };
+
+    const candidates = (data.places || [])
+      .filter(
+        (p) =>
+          p.displayName?.text &&
+          p.location?.latitude != null &&
+          p.location?.longitude != null &&
+          p.businessStatus !== "CLOSED_PERMANENTLY"
+      )
+      .map((p) => {
+        const lat = p.location!.latitude!;
+        const lon = p.location!.longitude!;
+        const dist = haversineMeters(start, { lat, lon });
+        const rating = p.rating ?? 3.8;
+        const count = p.userRatingCount ?? 10;
+        // Favor highly-rated, well-reviewed spots near idealMeters
+        const qualityScore = rating * Math.log10(count + 10) * 320;
+        const distPenalty = Math.abs(dist - idealMeters);
+        const lowRatingPenalty = rating < 4.0 ? (4.0 - rating) * 1800 : 0;
+        return {
+          name: p.displayName!.text!,
+          address: p.formattedAddress || p.displayName!.text!,
+          lat,
+          lon,
+          rating: p.rating,
+          ratingCount: p.userRatingCount,
+          score: qualityScore - distPenalty - lowRatingPenalty,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const results: PlaceSuggestion[] = [];
+    for (const c of candidates) {
+      const isDup = results.some(
+        (r) =>
+          r.shortName.toLowerCase() === c.name.toLowerCase() ||
+          haversineMeters(r, c) < 80
+      );
+      if (isDup) continue;
+      results.push({
+        label:
+          c.rating != null
+            ? `${c.name} (★ ${c.rating.toFixed(1)}${c.ratingCount ? `, ${c.ratingCount}` : ""})`
+            : `${c.name} (${endQuery})`,
+        shortName: c.name,
+        lat: c.lat,
+        lon: c.lon,
+        type: "food",
+        rating: c.rating,
+        ratingCount: c.ratingCount,
+      });
+      if (results.length >= maxResults) break;
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+async function resolveEndPlaces(
+  start: LatLng,
+  endQuery: string,
+  targetMiles?: number | null,
+  maxFoodResults = 4
+): Promise<PlaceSuggestion[]> {
   const idealMeters = targetMiles
     ? milesToMeters(targetMiles) * 0.85
     : 3200; // ~2 miles default for food/area runs
   const searchRadius = Math.min(Math.max(Math.round(idealMeters * 1.45), 2500), 14000);
+  const foodQuery = isFoodOrVibeQuery(endQuery);
 
-  // 1. If it looks like a food/drink query, search Overpass amenities/shops first
-  if (isFoodOrVibeQuery(endQuery)) {
+  // 1a. If GOOGLE_PLACES_API_KEY is configured and this is a food query, rank top spots by live star ratings + reviews
+  if (foodQuery && process.env.GOOGLE_PLACES_API_KEY) {
+    const ratedSpots = await resolveFoodViaGooglePlaces(
+      start,
+      endQuery,
+      idealMeters,
+      searchRadius,
+      maxFoodResults
+    );
+    if (ratedSpots.length > 0) return ratedSpots;
+  }
+
+  // 1b. Keyless food/drink search via Overpass (returns top distinct notable OSM spots)
+  if (foodQuery) {
     const clean = endQuery.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
     const firstWord = clean.split(/\s+/)[0] || clean;
     const overQuery = `
@@ -310,7 +474,7 @@ async function resolveEndPlace(
         node["shop"~"bakery|coffee|pastry"]["name"~"${firstWord}",i](around:${searchRadius},${start.lat},${start.lon});
         node["amenity"="cafe"](around:${searchRadius},${start.lat},${start.lon});
       );
-      out body 25;
+      out body 35;
     `;
     try {
       const res = await fetch(OVERPASS_BASE, {
@@ -336,85 +500,250 @@ async function resolveEndPlace(
               (tags.shop || "").toLowerCase().includes(firstWord);
             const dist = haversineMeters(start, { lat: el.lat!, lon: el.lon! });
             const distPenalty = Math.abs(dist - idealMeters);
+            // Proxy notability bonus when no ratings API key is configured
+            let notabilityBonus = 0;
+            if (tags.website || tags["contact:website"]) notabilityBonus += 350;
+            if (tags.opening_hours) notabilityBonus += 250;
+            if (tags.wikidata || tags.wikipedia) notabilityBonus += 500;
+            if (tags.stars || tags.award) notabilityBonus += 450;
             return {
               name,
               lat: el.lat!,
               lon: el.lon!,
               type: tags.cuisine || tags.amenity || tags.shop || "food",
-              score: (matchesKeyword ? 0 : 10000) + distPenalty,
+              score: (matchesKeyword ? 0 : 10000) + distPenalty - notabilityBonus,
             };
           })
+          .filter((c) => c.score < 10000)
           .sort((a, b) => a.score - b.score);
 
-        if (candidates.length > 0 && candidates[0].score < 10000) {
-          const best = candidates[0];
-          return {
-            label: `${best.name} (${endQuery})`,
-            shortName: best.name,
-            lat: best.lat,
-            lon: best.lon,
+        const picked: PlaceSuggestion[] = [];
+        for (const c of candidates) {
+          const isDup = picked.some(
+            (p) =>
+              p.shortName.toLowerCase() === c.name.toLowerCase() ||
+              haversineMeters(p, c) < 100
+          );
+          if (isDup) continue;
+          picked.push({
+            label: `${c.name} (${endQuery})`,
+            shortName: c.name,
+            lat: c.lat,
+            lon: c.lon,
             type: "food",
-          };
+          });
+          if (picked.length >= maxFoodResults) break;
         }
+        if (picked.length > 0) return picked;
       }
     } catch {
       // fall through to Nominatim
     }
   }
 
-  // 2. Bounded Nominatim search near start (handles addresses, neighborhoods, areas, or food names)
-  try {
-    const delta = 0.14; // ~15km box
-    const viewbox = `${start.lon - delta},${start.lat + delta},${start.lon + delta},${start.lat - delta}`;
-    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(endQuery)}&format=jsonv2&addressdetails=1&limit=5&viewbox=${viewbox}`;
+  // 2. Bounded Nominatim search near start (handles addresses, neighborhoods, directional sub-areas)
+  const delta = 0.14; // ~15km box
+  const viewbox = `${start.lon - delta},${start.lat + delta},${start.lon + delta},${start.lat - delta}`;
+
+  const queryNominatim = async (q: string) => {
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=6&viewbox=${viewbox}`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(5500),
     });
-    if (res.ok) {
-      const items = (await res.json()) as {
-        display_name: string;
-        lat: string;
-        lon: string;
-        name?: string;
-        type?: string;
-      }[];
-      if (items.length > 0) {
-        // Prefer one closest to idealMeters if multiple
-        const sorted = items
-          .map((it) => ({
-            it,
-            dist: haversineMeters(start, {
-              lat: parseFloat(it.lat),
-              lon: parseFloat(it.lon),
-            }),
-          }))
-          .sort(
-            (a, b) =>
-              Math.abs(a.dist - idealMeters) - Math.abs(b.dist - idealMeters)
-          );
-        const top = sorted[0].it;
-        const shortName =
-          top.name ||
-          top.display_name
-            .split(",")
-            .slice(0, 2)
-            .map((s) => s.trim())
-            .join(", ");
-        return {
+    if (!res.ok) return [];
+    return (await res.json()) as {
+      display_name: string;
+      lat: string;
+      lon: string;
+      name?: string;
+      category?: string;
+      type?: string;
+    }[];
+  };
+
+  try {
+    const items = await queryNominatim(endQuery);
+    const areaMatch = items.find(
+      (it) =>
+        (it.category && AREA_CATEGORIES.has(it.category)) ||
+        (it.type && AREA_TYPES.has(it.type))
+    );
+
+    // Handle directional neighborhood queries like "North Williamsburg", "South Slope", "East Village"
+    const dirMatch = endQuery
+      .trim()
+      .match(
+        /^(north|northern|south|southern|east|eastern|west|western|upper|lower)\s+(.+)$/i
+      );
+
+    if (dirMatch && !areaMatch) {
+      const dirWord = dirMatch[1].toLowerCase();
+      const baseArea = dirMatch[2].trim();
+      const baseItems = await queryNominatim(baseArea);
+      const baseNeighborhood = baseItems.find(
+        (it) =>
+          (it.category && AREA_CATEGORIES.has(it.category)) ||
+          (it.type && AREA_TYPES.has(it.type))
+      );
+
+      if (baseNeighborhood) {
+        const baseLat = parseFloat(baseNeighborhood.lat);
+        const baseLon = parseFloat(baseNeighborhood.lon);
+        const bearing = DIRECTION_PREFIX_BEARINGS[dirWord] ?? 0;
+        const shifted = destinationPoint({ lat: baseLat, lon: baseLon }, 650, bearing);
+        const cleanTitle = endQuery
+          .trim()
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+        return [
+          {
+            label: `${cleanTitle} (${baseNeighborhood.display_name})`,
+            shortName: cleanTitle,
+            lat: shifted.lat,
+            lon: shifted.lon,
+            type: "neighbourhood",
+          },
+        ];
+      }
+    }
+
+    if (items.length > 0) {
+      // Prefer neighborhoods/parks/piers over random unrelated POIs (schools, clinics, dentists)
+      const sorted = items
+        .map((it) => {
+          const dist = haversineMeters(start, {
+            lat: parseFloat(it.lat),
+            lon: parseFloat(it.lon),
+          });
+          const isArea =
+            (it.category && AREA_CATEGORIES.has(it.category)) ||
+            (it.type && AREA_TYPES.has(it.type));
+          const isNoise = it.type && NOISE_POI_TYPES.has(it.type);
+          const rankPenalty =
+            Math.abs(dist - idealMeters) -
+            (isArea ? 1500 : 0) +
+            (isNoise ? 3500 : 0);
+          return { it, rankPenalty };
+        })
+        .sort((a, b) => a.rankPenalty - b.rankPenalty);
+
+      const top = sorted[0].it;
+      const shortName =
+        top.name ||
+        top.display_name
+          .split(",")
+          .slice(0, 2)
+          .map((s) => s.trim())
+          .join(", ");
+      return [
+        {
           label: top.display_name,
           shortName,
           lat: parseFloat(top.lat),
           lon: parseFloat(top.lon),
           type: top.type,
-        };
-      }
+        },
+      ];
     }
   } catch {
     // ignore
   }
 
-  return null;
+  return [];
+}
+
+async function fetchValhallaFootRoute(
+  waypoints: LatLng[],
+  elevationPref: ElevationPreference
+): Promise<OSRMRoute | null> {
+  const valhallaUrl = process.env.VALHALLA_URL?.trim();
+  if (!valhallaUrl) return null;
+
+  const useHills =
+    elevationPref === "flat" ? 0.1 : elevationPref === "hilly" ? 0.92 : 0.5;
+
+  try {
+    const res = await fetch(valhallaUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({
+        locations: waypoints.map((p, idx) => ({
+          lat: p.lat,
+          lon: p.lon,
+          type:
+            idx === 0 || idx === waypoints.length - 1 ? "break" : "through",
+        })),
+        costing: "pedestrian",
+        costing_options: {
+          pedestrian: {
+            walkway_factor: 0.72,
+            sidewalk_factor: 0.85,
+            alley_factor: 1.6,
+            use_tracks: 0.9,
+            use_hills: useHills,
+            use_lit: 0.35,
+          },
+        },
+        units: "kilometers",
+      }),
+      signal: AbortSignal.timeout(7000),
+    });
+
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      trip?: {
+        summary?: { length?: number; time?: number };
+        legs?: {
+          shape?: string;
+          maneuvers?: {
+            length?: number;
+            time?: number;
+            street_names?: string[];
+            travel_type?: string;
+          }[];
+        }[];
+      };
+    };
+
+    const trip = data.trip;
+    if (!trip?.legs?.length) return null;
+
+    const allCoordsLonLat: [number, number][] = [];
+    const legs: { steps: OSRMStep[] }[] = [];
+
+    for (const leg of trip.legs) {
+      if (leg.shape) {
+        const decodedLatLon = decodePolyline6(leg.shape);
+        for (const [lat, lon] of decodedLatLon) {
+          allCoordsLonLat.push([lon, lat]);
+        }
+      }
+      const steps: OSRMStep[] = (leg.maneuvers || []).map((m) => ({
+        distance: (m.length ?? 0) * 1000,
+        duration: m.time ?? 0,
+        name: m.street_names?.[0] || "",
+        mode: m.travel_type || "foot",
+      }));
+      legs.push({ steps });
+    }
+
+    if (allCoordsLonLat.length < 2) return null;
+
+    return {
+      distance: (trip.summary?.length ?? 0) * 1000,
+      duration: trip.summary?.time ?? 0,
+      geometry: {
+        type: "LineString",
+        coordinates: allCoordsLonLat,
+      },
+      legs,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function fetchOSRMFootRoute(
@@ -439,15 +768,29 @@ async function fetchOSRMFootRoute(
   }
 }
 
-interface LightingSignals {
-  litPoints: LatLng[];
-  unlitPoints: LatLng[];
+async function fetchFootRoute(
+  waypoints: LatLng[],
+  elevationPref: ElevationPreference = "any"
+): Promise<OSRMRoute | null> {
+  if (process.env.VALHALLA_URL?.trim()) {
+    const valhallaRoute = await fetchValhallaFootRoute(waypoints, elevationPref);
+    if (valhallaRoute) return valhallaRoute;
+  }
+  return fetchOSRMFootRoute(waypoints);
 }
 
-async function fetchLightingSignals(
+interface RouteEnvironmentSignals {
+  litPoints: LatLng[];
+  unlitPoints: LatLng[];
+  trafficSignals: LatLng[];
+  waterFountains: LatLng[];
+  restrooms: LatLng[];
+}
+
+async function fetchRouteEnvironmentSignals(
   center: LatLng,
   radiusMeters: number
-): Promise<LightingSignals> {
+): Promise<RouteEnvironmentSignals> {
   const r = Math.min(Math.max(Math.round(radiusMeters), 1500), 7000);
   const query = `
     [out:json][timeout:6];
@@ -455,8 +798,11 @@ async function fetchLightingSignals(
       node["highway"="street_lamp"](around:${r},${center.lat},${center.lon});
       way["lit"="yes"](around:${r},${center.lat},${center.lon});
       way["lit"="no"](around:${r},${center.lat},${center.lon});
+      node["highway"="traffic_signals"](around:${r},${center.lat},${center.lon});
+      node["amenity"="drinking_water"](around:${r},${center.lat},${center.lon});
+      node["amenity"="toilets"](around:${r},${center.lat},${center.lon});
     );
-    out center 120;
+    out center 220;
   `;
 
   try {
@@ -469,31 +815,61 @@ async function fetchLightingSignals(
       body: `data=${encodeURIComponent(query)}`,
       signal: AbortSignal.timeout(5500),
     });
-    if (!res.ok) return { litPoints: [], unlitPoints: [] };
+    if (!res.ok) {
+      return {
+        litPoints: [],
+        unlitPoints: [],
+        trafficSignals: [],
+        waterFountains: [],
+        restrooms: [],
+      };
+    }
     const data = (await res.json()) as { elements?: OverpassElement[] };
     const litPoints: LatLng[] = [];
     const unlitPoints: LatLng[] = [];
+    const trafficSignals: LatLng[] = [];
+    const waterFountains: LatLng[] = [];
+    const restrooms: LatLng[] = [];
 
     for (const el of data.elements || []) {
       const lat = el.lat ?? el.center?.lat;
       const lon = el.lon ?? el.center?.lon;
       if (!lat || !lon) continue;
-      if (el.tags?.lit === "no") {
+      const tags = el.tags || {};
+      if (tags.highway === "traffic_signals") {
+        trafficSignals.push({ lat, lon });
+      } else if (tags.amenity === "drinking_water") {
+        waterFountains.push({ lat, lon });
+      } else if (tags.amenity === "toilets") {
+        restrooms.push({ lat, lon });
+      } else if (tags.lit === "no") {
         unlitPoints.push({ lat, lon });
       } else {
         litPoints.push({ lat, lon });
       }
     }
-    return { litPoints, unlitPoints };
+    return {
+      litPoints,
+      unlitPoints,
+      trafficSignals,
+      waterFountains,
+      restrooms,
+    };
   } catch {
-    return { litPoints: [], unlitPoints: [] };
+    return {
+      litPoints: [],
+      unlitPoints: [],
+      trafficSignals: [],
+      waterFountains: [],
+      restrooms: [],
+    };
   }
 }
 
 function computeNightLightingScore(
   coords: [number, number][],
   surfaceBreakdown: SurfaceBreakdown,
-  lighting: LightingSignals
+  lighting: RouteEnvironmentSignals
 ): { nightScore: number; nightLabel: "Well Lit" | "Moderate Light" | "Low Light" } {
   // Baseline from surface type: streets/sidewalks usually have street lighting;
   // unmapped trails/parks can be darker unless lit=yes or street lamps are present
@@ -665,7 +1041,8 @@ async function buildTrackLapRoute(
   track: TrackGeometry,
   targetMeters: number,
   scenicPois: ScenicPOI[],
-  lightingSignals: LightingSignals
+  envSignals: RouteEnvironmentSignals,
+  elevationPref: ElevationPreference
 ): Promise<RunRoute | null> {
   // Find closest vertex on track to start
   let entryIdx = 0;
@@ -680,7 +1057,7 @@ async function buildTrackLapRoute(
   if (bestDist > Math.max(targetMeters * 0.4, 2200)) return null;
 
   const entryPt = track.points[entryIdx];
-  const approach = await fetchOSRMFootRoute([start, entryPt]);
+  const approach = await fetchFootRoute([start, entryPt], elevationPref);
   if (!approach) return null;
 
   const remainingMeters = targetMeters - approach.distance * 2;
@@ -749,8 +1126,19 @@ async function buildTrackLapRoute(
   const night = computeNightLightingScore(
     coords,
     surfaceBreakdown,
-    lightingSignals
+    envSignals
   );
+  const trafficLights = countNearbyPoints(
+    approachCoords,
+    envSignals.trafficSignals,
+    35
+  );
+  const waterFountains = countNearbyPoints(
+    coords,
+    envSignals.waterFountains,
+    90
+  );
+  const restrooms = countNearbyPoints(coords, envSignals.restrooms, 100);
   const nearbyPois = findNearbyPOIs(coords, scenicPois, 260);
   const sceneryScore = Math.min(
     99,
@@ -768,6 +1156,9 @@ async function buildTrackLapRoute(
     sceneryScore,
     nightScore: night.nightScore,
     nightLabel: night.nightLabel,
+    trafficLights,
+    waterFountains,
+    restrooms,
     lapInfo: {
       laps,
       featureName: track.name,
@@ -804,6 +1195,7 @@ export async function POST(req: NextRequest) {
       endQuery,
       endPlace,
       preferLoop = true,
+      elevationPref = "any",
     } = body;
 
     if (!start || typeof start.lat !== "number" || typeof start.lon !== "number") {
@@ -821,125 +1213,190 @@ export async function POST(req: NextRequest) {
       ? Math.min((minMiles + maxMiles) / 2, 30)
       : null;
 
-    // Resolve end destination if user typed a food/area/address
-    let resolvedEnd: PlaceSuggestion | null = endPlace || null;
-    if (!resolvedEnd && endQuery && endQuery.trim().length > 0) {
-      resolvedEnd = await resolveEndPlace(start, endQuery.trim(), desiredMiles);
+    // Resolve end destination(s) if user typed a food craving, neighborhood, or address
+    let resolvedEnds: PlaceSuggestion[] = endPlace ? [endPlace] : [];
+    if (resolvedEnds.length === 0 && endQuery && endQuery.trim().length > 0) {
+      resolvedEnds = await resolveEndPlaces(
+        start,
+        endQuery.trim(),
+        desiredMiles,
+        4
+      );
     }
+    const resolvedEnd: PlaceSuggestion | null = resolvedEnds[0] || null;
 
     const effectiveMiles = desiredMiles ?? (resolvedEnd ? 2.5 : 3.5);
     const searchRadius = milesToMeters(effectiveMiles) * 0.75;
-    const [{ pois: scenicPois, parks, tracks }, lightingSignals] =
+    const [{ pois: scenicPois, parks, tracks }, envSignals] =
       await Promise.all([
         fetchScenicAndRoutingFeatures(start, searchRadius),
-        fetchLightingSignals(start, searchRadius),
+        fetchRouteEnvironmentSignals(start, searchRadius),
       ]);
 
     const routes: RunRoute[] = [];
 
-    if (resolvedEnd) {
-      // --- POINT-TO-POINT MODE ---
-      const directDist = haversineMeters(start, resolvedEnd);
-      const midPoint: LatLng = {
-        lat: (start.lat + resolvedEnd.lat) / 2,
-        lon: (start.lon + resolvedEnd.lon) / 2,
-      };
-      const corridorParks = parks
-        .filter(
-          (p) =>
-            haversineMeters(midPoint, p.centroid) <
-              Math.max(directDist * 0.85, 2200) &&
-            haversineMeters(start, p.centroid) > 150 &&
-            haversineMeters(resolvedEnd!, p.centroid) > 150
-        )
-        .slice(0, 3);
-
-      const corridorPois = scenicPois
-        .filter(
-          (p) =>
-            haversineMeters(midPoint, p) < Math.max(directDist * 0.85, 2000) &&
-            haversineMeters(start, p) > 250 &&
-            haversineMeters(resolvedEnd!, p) > 250
-        )
-        .slice(0, 6);
-
+    if (resolvedEnds.length > 0) {
+      // --- POINT-TO-POINT MODE (supports single destination OR multiple top-rated food spots) ---
       const candidateWaypoints: {
         name: string;
         tagline: string;
         points: LatLng[];
-      }[] = [
-        {
-          name: `Scenic Path to ${resolvedEnd.shortName}`,
-          tagline: "Low-traffic pedestrian & park-friendly route",
-          points: [start, resolvedEnd],
-        },
-      ];
+        end: PlaceSuggestion;
+      }[] = [];
 
-      // Park-Interior Chaining: route through entry -> interior -> exit of corridor parks
-      for (const park of corridorParks) {
-        const { entry, interior, exit } = extractParkTraversePoints(
-          park,
-          start,
-          resolvedEnd
-        );
-        candidateWaypoints.push({
-          name: `Through ${park.name}`,
-          tagline: `Routes through the interior trails of ${park.name} to ${resolvedEnd.shortName}`,
-          points: [start, entry, interior, exit, resolvedEnd],
-        });
-      }
-
-      if (corridorPois[0]) {
-        candidateWaypoints.push({
-          name: `Via ${corridorPois[0].name}`,
-          tagline: `Detours through ${corridorPois[0].name} for extra greenery`,
-          points: [start, corridorPois[0], resolvedEnd],
-        });
-      }
-      if (corridorPois[1]) {
-        candidateWaypoints.push({
-          name: `${corridorPois[1].name} Greenway`,
-          tagline: `Scenic nature & landmark corridor to ${resolvedEnd.shortName}`,
-          points: [start, corridorPois[1], resolvedEnd],
-        });
-      }
-
-      // Ensure up to 9 distinct route options even when Overpass has fewer corridor POIs
-      if (candidateWaypoints.length < 9) {
-        const brg = bearingDegrees(start, resolvedEnd);
-        const sideDist =
-          desiredMiles && milesToMeters(desiredMiles) > directDist * 1.25
-            ? Math.min((milesToMeters(desiredMiles) - directDist) * 0.45, 3500)
-            : Math.min(Math.max(directDist * 0.25, 350), 1400);
-
-        const arcs = [
-          { angle: 85, mult: 1.0, name: "Quiet Parkside Detour", tagline: `Alternative low-traffic path to ${resolvedEnd.shortName}` },
-          { angle: 275, mult: 1.0, name: "Alternate Scenic Corridor", tagline: `Secondary quiet-street route to ${resolvedEnd.shortName}` },
-          { angle: 55, mult: 1.35, name: "Extended Greenway Loop-In", tagline: `Longer low-traffic approach to ${resolvedEnd.shortName}` },
-          { angle: 305, mult: 1.35, name: "Wide Neighborhood Path", tagline: `Calm residential & trail route to ${resolvedEnd.shortName}` },
-          { angle: 110, mult: 0.75, name: "Inner Side-Street Path", tagline: `Direct quiet-street alternative to ${resolvedEnd.shortName}` },
-          { angle: 250, mult: 0.75, name: "Westside Trail Connector", tagline: `Low-traffic connector to ${resolvedEnd.shortName}` },
-          { angle: 40, mult: 1.6, name: "Outer Scenic Arc", tagline: `Longer scenic run to ${resolvedEnd.shortName}` },
-          { angle: 320, mult: 1.6, name: "Parkway Bypass Route", tagline: `Avoids main roads on the way to ${resolvedEnd.shortName}` },
-        ];
-
-        for (const arc of arcs) {
-          if (candidateWaypoints.length >= 9) break;
-          const wp = destinationPoint(midPoint, sideDist * arc.mult, (brg + arc.angle) % 360);
+      if (resolvedEnds.length > 1) {
+        // Multi-destination food mode: generate direct + park/scenic variants across top-rated spots
+        for (const spot of resolvedEnds) {
+          const ratingSnippet =
+            spot.rating != null ? ` (★ ${spot.rating.toFixed(1)})` : "";
           candidateWaypoints.push({
-            name: arc.name,
-            tagline: arc.tagline,
-            points: [start, wp, resolvedEnd],
+            name: `Run to ${spot.shortName}`,
+            tagline: `Low-traffic route to ${spot.shortName}${ratingSnippet}`,
+            points: [start, spot],
+            end: spot,
           });
+
+          const directDist = haversineMeters(start, spot);
+          const midPt: LatLng = {
+            lat: (start.lat + spot.lat) / 2,
+            lon: (start.lon + spot.lon) / 2,
+          };
+          const spotPark = parks.find(
+            (p) =>
+              haversineMeters(midPt, p.centroid) <
+                Math.max(directDist * 0.8, 1800) &&
+              haversineMeters(start, p.centroid) > 150 &&
+              haversineMeters(spot, p.centroid) > 150
+          );
+
+          if (spotPark) {
+            const { entry, interior, exit } = extractParkTraversePoints(
+              spotPark,
+              start,
+              spot
+            );
+            candidateWaypoints.push({
+              name: `${spotPark.name} → ${spot.shortName}`,
+              tagline: `Chains through ${spotPark.name} trails to ${spot.shortName}${ratingSnippet}`,
+              points: [start, entry, interior, exit, spot],
+              end: spot,
+            });
+          } else {
+            const brg = bearingDegrees(start, spot);
+            const sideDist = Math.min(Math.max(directDist * 0.22, 300), 1100);
+            const wp = destinationPoint(midPt, sideDist, (brg + 80) % 360);
+            candidateWaypoints.push({
+              name: `Scenic Path to ${spot.shortName}`,
+              tagline: `Quiet-street detour to ${spot.shortName}${ratingSnippet}`,
+              points: [start, wp, spot],
+              end: spot,
+            });
+          }
+        }
+      } else {
+        const primaryEnd = resolvedEnds[0];
+        const directDist = haversineMeters(start, primaryEnd);
+        const midPoint: LatLng = {
+          lat: (start.lat + primaryEnd.lat) / 2,
+          lon: (start.lon + primaryEnd.lon) / 2,
+        };
+        const corridorParks = parks
+          .filter(
+            (p) =>
+              haversineMeters(midPoint, p.centroid) <
+                Math.max(directDist * 0.85, 2200) &&
+              haversineMeters(start, p.centroid) > 150 &&
+              haversineMeters(primaryEnd, p.centroid) > 150
+          )
+          .slice(0, 3);
+
+        const corridorPois = scenicPois
+          .filter(
+            (p) =>
+              haversineMeters(midPoint, p) < Math.max(directDist * 0.85, 2000) &&
+              haversineMeters(start, p) > 250 &&
+              haversineMeters(primaryEnd, p) > 250
+          )
+          .slice(0, 6);
+
+        candidateWaypoints.push({
+          name: `Scenic Path to ${primaryEnd.shortName}`,
+          tagline: "Low-traffic pedestrian & park-friendly route",
+          points: [start, primaryEnd],
+          end: primaryEnd,
+        });
+
+        // Park-Interior Chaining: route through entry -> interior -> exit of corridor parks
+        for (const park of corridorParks) {
+          const { entry, interior, exit } = extractParkTraversePoints(
+            park,
+            start,
+            primaryEnd
+          );
+          candidateWaypoints.push({
+            name: `Through ${park.name}`,
+            tagline: `Routes through the interior trails of ${park.name} to ${primaryEnd.shortName}`,
+            points: [start, entry, interior, exit, primaryEnd],
+            end: primaryEnd,
+          });
+        }
+
+        if (corridorPois[0]) {
+          candidateWaypoints.push({
+            name: `Via ${corridorPois[0].name}`,
+            tagline: `Detours through ${corridorPois[0].name} for extra greenery`,
+            points: [start, corridorPois[0], primaryEnd],
+            end: primaryEnd,
+          });
+        }
+        if (corridorPois[1]) {
+          candidateWaypoints.push({
+            name: `${corridorPois[1].name} Greenway`,
+            tagline: `Scenic nature & landmark corridor to ${primaryEnd.shortName}`,
+            points: [start, corridorPois[1], primaryEnd],
+            end: primaryEnd,
+          });
+        }
+
+        // Ensure up to 9 distinct route options even when Overpass has fewer corridor POIs
+        if (candidateWaypoints.length < 9) {
+          const brg = bearingDegrees(start, primaryEnd);
+          const sideDist =
+            desiredMiles && milesToMeters(desiredMiles) > directDist * 1.25
+              ? Math.min((milesToMeters(desiredMiles) - directDist) * 0.45, 3500)
+              : Math.min(Math.max(directDist * 0.25, 350), 1400);
+
+          const arcs = [
+            { angle: 85, mult: 1.0, name: "Quiet Parkside Detour", tagline: `Alternative low-traffic path to ${primaryEnd.shortName}` },
+            { angle: 275, mult: 1.0, name: "Alternate Scenic Corridor", tagline: `Secondary quiet-street route to ${primaryEnd.shortName}` },
+            { angle: 55, mult: 1.35, name: "Extended Greenway Loop-In", tagline: `Longer low-traffic approach to ${primaryEnd.shortName}` },
+            { angle: 305, mult: 1.35, name: "Wide Neighborhood Path", tagline: `Calm residential & trail route to ${primaryEnd.shortName}` },
+            { angle: 110, mult: 0.75, name: "Inner Side-Street Path", tagline: `Direct quiet-street alternative to ${primaryEnd.shortName}` },
+            { angle: 250, mult: 0.75, name: "Westside Trail Connector", tagline: `Low-traffic connector to ${primaryEnd.shortName}` },
+            { angle: 40, mult: 1.6, name: "Outer Scenic Arc", tagline: `Longer scenic run to ${primaryEnd.shortName}` },
+            { angle: 320, mult: 1.6, name: "Parkway Bypass Route", tagline: `Avoids main roads on the way to ${primaryEnd.shortName}` },
+          ];
+
+          for (const arc of arcs) {
+            if (candidateWaypoints.length >= 9) break;
+            const wp = destinationPoint(midPoint, sideDist * arc.mult, (brg + arc.angle) % 360);
+            candidateWaypoints.push({
+              name: arc.name,
+              tagline: arc.tagline,
+              points: [start, wp, primaryEnd],
+              end: primaryEnd,
+            });
+          }
         }
       }
 
-      const osrmResults = await Promise.all(
-        candidateWaypoints.map((c) => fetchOSRMFootRoute(c.points))
+      const routeResults = await Promise.all(
+        candidateWaypoints.map((c) => fetchFootRoute(c.points, elevationPref))
       );
 
-      osrmResults.forEach((osrm, idx) => {
+      routeResults.forEach((osrm, idx) => {
         if (!osrm) return;
+        const cand = candidateWaypoints[idx];
         const coords: [number, number][] = osrm.geometry.coordinates.map(
           ([lon, lat]) => [lat, lon]
         );
@@ -948,14 +1405,25 @@ export async function POST(req: NextRequest) {
         const night = computeNightLightingScore(
           coords,
           analysis.surfaceBreakdown,
-          lightingSignals
+          envSignals
         );
+        const trafficLights = countNearbyPoints(
+          coords,
+          envSignals.trafficSignals,
+          35
+        );
+        const waterFountains = countNearbyPoints(
+          coords,
+          envSignals.waterFountains,
+          90
+        );
+        const restrooms = countNearbyPoints(coords, envSignals.restrooms, 100);
         const estMinutes = Math.max(5, Math.round(distMiles * 9.0));
 
         routes.push({
           id: `p2p-${idx}-${Math.round(osrm.distance)}`,
-          name: candidateWaypoints[idx].name,
-          tagline: candidateWaypoints[idx].tagline,
+          name: cand.name,
+          tagline: cand.tagline,
           mode: "point-to-point",
           distanceMiles: Math.round(distMiles * 100) / 100,
           estimatedMinutes: estMinutes,
@@ -964,19 +1432,22 @@ export async function POST(req: NextRequest) {
           nightScore: night.nightScore,
           nightLabel: night.nightLabel,
           uniquePathPct: preferLoop ? analysis.uniquePathPct : undefined,
+          trafficLights,
+          waterFountains,
+          restrooms,
           surfaceBreakdown: analysis.surfaceBreakdown,
           highlights: analysis.highlights,
           start,
-          end: resolvedEnd!,
-          destinationFoodOrArea: endQuery || resolvedEnd!.shortName,
+          end: cand.end,
+          destinationFoodOrArea: endQuery || cand.end.shortName,
           coordinates: coords,
           pois: [
             ...analysis.nearbyPois.slice(0, 6),
             {
-              name: resolvedEnd!.shortName,
-              category: resolvedEnd!.type === "food" ? "food" : "landmark",
-              lat: resolvedEnd!.lat,
-              lon: resolvedEnd!.lon,
+              name: cand.end.shortName,
+              category: cand.end.type === "food" ? "food" : "landmark",
+              lat: cand.end.lat,
+              lon: cand.end.lon,
             },
           ],
         });
@@ -1078,7 +1549,7 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      // Pass 1: Fetch OSRM loops + Track-lap route (if a running track is nearby) in parallel
+      // Pass 1: Fetch loops + Track-lap route (if a running track is nearby) in parallel
       const trackPromise =
         tracks.length > 0
           ? buildTrackLapRoute(
@@ -1086,12 +1557,15 @@ export async function POST(req: NextRequest) {
               tracks[0],
               targetMeters,
               scenicPois,
-              lightingSignals
+              envSignals,
+              elevationPref
             )
           : Promise.resolve(null);
 
       const [pass1Results, trackRoute] = await Promise.all([
-        Promise.all(loopTemplates.map((t) => fetchOSRMFootRoute(t.waypoints))),
+        Promise.all(
+          loopTemplates.map((t) => fetchFootRoute(t.waypoints, elevationPref))
+        ),
         trackPromise,
       ]);
 
@@ -1129,7 +1603,7 @@ export async function POST(req: NextRequest) {
         );
         recalibrationTasks.push({
           idx,
-          promise: fetchOSRMFootRoute(scaledWaypoints),
+          promise: fetchFootRoute(scaledWaypoints, elevationPref),
         });
       });
 
@@ -1163,8 +1637,19 @@ export async function POST(req: NextRequest) {
         const night = computeNightLightingScore(
           coords,
           analysis.surfaceBreakdown,
-          lightingSignals
+          envSignals
         );
+        const trafficLights = countNearbyPoints(
+          coords,
+          envSignals.trafficSignals,
+          35
+        );
+        const waterFountains = countNearbyPoints(
+          coords,
+          envSignals.waterFountains,
+          90
+        );
+        const restrooms = countNearbyPoints(coords, envSignals.restrooms, 100);
         const estMinutes = Math.max(5, Math.round(distMiles * 9.0));
 
         routes.push({
@@ -1179,6 +1664,9 @@ export async function POST(req: NextRequest) {
           nightScore: night.nightScore,
           nightLabel: night.nightLabel,
           uniquePathPct: preferLoop ? analysis.uniquePathPct : undefined,
+          trafficLights,
+          waterFountains,
+          restrooms,
           surfaceBreakdown: analysis.surfaceBreakdown,
           highlights: analysis.highlights,
           start,
@@ -1189,8 +1677,23 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // Fetch real elevation stats in parallel BEFORE final ranking so elevation preference works accurately
+    await Promise.all(
+      routes.map(async (r) => {
+        const elev = await fetchRouteElevationStats(
+          r.coordinates,
+          r.distanceMiles
+        );
+        if (elev) {
+          r.elevationGainFt = elev.elevationGainFt;
+          r.terrainLabel = elev.terrainLabel;
+        }
+      })
+    );
+
     // Cost-weighted multi-objective ranking:
-    // prioritizes car-free & low-traffic paths, scenery, unique roads (for loops),
+    // prioritizes car-free & low-traffic paths, scenery, minimal traffic lights,
+    // unique roads (for loops), elevation preference, water/restrooms on long runs,
     // night lighting tie-breaker, and tight distance-range fit.
     const midMiles =
       hasRange && minMiles != null && maxMiles != null
@@ -1209,48 +1712,79 @@ export async function POST(req: NextRequest) {
         }
       }
       const repeatBonus =
-        preferLoop && !r.lapInfo ? (r.uniquePathPct ?? 100) * 0.32 : 0;
+        preferLoop && !r.lapInfo ? (r.uniquePathPct ?? 100) * 0.3 : 0;
       const nightTieBreaker = (r.nightScore ?? 60) * 0.08;
       const trackMatchBonus = r.lapInfo && rangePenalty === 0 ? 6 : 0;
 
+      // Penalize stop-and-go traffic-light crossings per mile
+      const lightsPerMile =
+        (r.trafficLights ?? 0) / Math.max(0.5, r.distanceMiles);
+      const trafficLightPenalty = Math.min(18, lightsPerMile * 2.4);
+
+      // Elevation preference bonus/penalty (Flat vs Hilly)
+      let elevationAdjustment = 0;
+      if (r.elevationGainFt != null && r.distanceMiles > 0) {
+        const ftPerMile = r.elevationGainFt / r.distanceMiles;
+        if (elevationPref === "flat") {
+          elevationAdjustment =
+            ftPerMile <= 35 ? 10 : -Math.min(20, (ftPerMile - 35) * 0.22);
+        } else if (elevationPref === "hilly") {
+          elevationAdjustment =
+            Math.min(18, ftPerMile * 0.16) - (ftPerMile < 25 ? 8 : 0);
+        }
+      }
+
+      // Bonus for drinking water & restrooms on longer runs (>= 4 miles)
+      const amenityBonus =
+        r.distanceMiles >= 4
+          ? Math.min(
+              4,
+              (r.waterFountains ?? 0) * 1.2 + (r.restrooms ?? 0) * 0.8
+            )
+          : 0;
+
+      // Slight food rating boost when comparing multiple food spots
+      const foodRatingBonus =
+        r.end.rating != null ? (r.end.rating - 4.0) * 5 : 0;
+
       return (
-        r.trafficFreePct * 0.48 +
-        r.sceneryScore * 0.34 +
+        r.trafficFreePct * 0.46 +
+        r.sceneryScore * 0.32 +
         repeatBonus +
         nightTieBreaker +
-        trackMatchBonus -
+        trackMatchBonus +
+        elevationAdjustment +
+        amenityBonus +
+        foodRatingBonus -
+        trafficLightPenalty -
         rangePenalty
       );
     };
 
     routes.sort((a, b) => scoreRoute(b) - scoreRoute(a));
 
-    // Deduplicate near-identical routes and cap to top 9 (UI shows 3 at a time)
+    // Spatial polyline overlap deduplication: ensure top 9 routes are genuinely distinct corridors
+    // (preserve routes going to different food destinations even if they share the start corridor)
     const uniqueRoutes: RunRoute[] = [];
     for (const r of routes) {
-      const isDup = uniqueRoutes.some(
-        (u) =>
+      const isDup = uniqueRoutes.some((u) => {
+        const differentDestination =
+          r.mode === "point-to-point" &&
+          u.mode === "point-to-point" &&
+          haversineMeters(u.end, r.end) > 120;
+        if (differentDestination) return false;
+
+        const scalarNearDup =
           Math.abs(u.distanceMiles - r.distanceMiles) < 0.05 &&
           u.trafficFreePct === r.trafficFreePct &&
-          u.sceneryScore === r.sceneryScore
-      );
+          u.sceneryScore === r.sceneryScore;
+        if (scalarNearDup) return true;
+
+        return computePolylineOverlap(r.coordinates, u.coordinates, 60) >= 0.72;
+      });
       if (!isDup) uniqueRoutes.push(r);
       if (uniqueRoutes.length >= 9) break;
     }
-
-    // Fetch real elevation stats in parallel for the top 1-5 routes
-    await Promise.all(
-      uniqueRoutes.map(async (r) => {
-        const elev = await fetchRouteElevationStats(
-          r.coordinates,
-          r.distanceMiles
-        );
-        if (elev) {
-          r.elevationGainFt = elev.elevationGainFt;
-          r.terrainLabel = elev.terrainLabel;
-        }
-      })
-    );
 
     return NextResponse.json({
       routes: uniqueRoutes,

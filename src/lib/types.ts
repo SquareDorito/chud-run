@@ -9,6 +9,8 @@ export interface PlaceSuggestion {
   lat: number;
   lon: number;
   type?: string;
+  rating?: number;
+  ratingCount?: number;
 }
 
 export interface ScenicPOI {
@@ -24,6 +26,8 @@ export interface SurfaceBreakdown {
   mainRoadPct: number;
 }
 
+export type ElevationPreference = "any" | "flat" | "hilly";
+
 export interface RunRoute {
   id: string;
   name: string;
@@ -38,6 +42,9 @@ export interface RunRoute {
   nightScore?: number;
   nightLabel?: "Well Lit" | "Moderate Light" | "Low Light";
   uniquePathPct?: number;
+  trafficLights?: number;
+  waterFountains?: number;
+  restrooms?: number;
   lapInfo?: {
     laps: number;
     featureName: string;
@@ -61,6 +68,7 @@ export interface RouteSearchRequest {
   endQuery?: string;
   endPlace?: PlaceSuggestion | null;
   preferLoop?: boolean;
+  elevationPref?: ElevationPreference;
 }
 
 export interface RouteSearchResponse {

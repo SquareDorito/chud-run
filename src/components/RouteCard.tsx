@@ -57,7 +57,11 @@ export default function RouteCard({
               {route.mode === "loop"
                 ? "Scenic Loop"
                 : route.destinationFoodOrArea
-                ? `Run → ${route.end.shortName}`
+                ? `Run → ${route.end.shortName}${
+                    route.end.rating != null
+                      ? ` ★ ${route.end.rating.toFixed(1)}`
+                      : ""
+                  }`
                 : "Point-to-Point"}
             </span>
             {route.lapInfo && (
@@ -110,7 +114,12 @@ export default function RouteCard({
         </div>
       </div>
 
-      {(route.terrainLabel || route.uniquePathPct != null || route.nightLabel) && (
+      {(route.terrainLabel ||
+        route.uniquePathPct != null ||
+        route.nightLabel ||
+        route.trafficLights != null ||
+        (route.waterFountains ?? 0) > 0 ||
+        (route.restrooms ?? 0) > 0) && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 font-medium mb-2">
           {route.terrainLabel && (
             <span>
@@ -136,6 +145,39 @@ export default function RouteCard({
                 {route.uniquePathPct}%
               </span>{" "}
               unique roads
+            </span>
+          )}
+          {route.trafficLights != null && (
+            <span>
+              <span
+                className={`font-semibold ${
+                  route.trafficLights <= 2
+                    ? "text-emerald-700"
+                    : "text-slate-700"
+                }`}
+              >
+                {route.trafficLights === 0
+                  ? "No lights"
+                  : `${route.trafficLights} ${
+                      route.trafficLights === 1 ? "light" : "lights"
+                    }`}
+              </span>
+            </span>
+          )}
+          {(route.waterFountains ?? 0) > 0 && (
+            <span title="Drinking water fountains near route">
+              💧{" "}
+              <span className="font-semibold text-slate-700">
+                {route.waterFountains}
+              </span>
+            </span>
+          )}
+          {(route.restrooms ?? 0) > 0 && (
+            <span title="Public restrooms near route">
+              🚻{" "}
+              <span className="font-semibold text-slate-700">
+                {route.restrooms}
+              </span>
             </span>
           )}
         </div>

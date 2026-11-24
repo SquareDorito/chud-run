@@ -149,3 +149,105 @@ export async function fetchRouteElevationStats(
     return null;
   }
 }
+
+/**
+ * Decodes a Valhalla precision-6 encoded polyline into [lat, lon] pairs.
+ */
+export function decodePolyline6(encoded: string): [number, number][] {
+  const coords: [number, number][] = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+
+  while (index < encoded.length) {
+    let shift = 0;
+    let result = 0;
+    let b: number;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20 && index < encoded.length);
+    const dLat = result & 1 ? ~(result >> 1) : result >> 1;
+    lat += dLat;
+
+    shift = 0;
+    result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20 && index < encoded.length);
+    const dLon = result & 1 ? ~(result >> 1) : result >> 1;
+    lon += dLon;
+
+    coords.push([lat / 1e6, lon / 1e6]);
+  }
+
+  return coords;
+}
+
+/**
+ * Computes the fraction (0..1) of sampled points in `coordsA` that lie within
+ * `thresholdMeters` of any sampled point in `coordsB`.
+ */
+export function computePolylineOverlap(
+  coordsA: [number, number][],
+  coordsB: [number, number][],
+  thresholdMeters = 60
+): number {
+  if (coordsA.length < 2 || coordsB.length < 2) return 0;
+
+  const sample = (coords: [number, number][], count: number): LatLng[] => {
+    const n = Math.min(count, coords.length);
+    const pts: LatLng[] = [];
+    for (let i = 0; i < n; i++) {
+      const idx = Math.min(
+        coords.length - 1,
+        Math.round((i * (coords.length - 1)) / Math.max(1, n - 1))
+      );
+      pts.push({ lat: coords[idx][0], lon: coords[idx][1] });
+    }
+    return pts;
+  };
+
+  const ptsA = sample(coordsA, 32);
+  const ptsB = sample(coordsB, 32);
+
+  let matched = 0;
+  for (const a of ptsA) {
+    if (ptsB.some((b) => haversineMeters(a, b) <= thresholdMeters)) {
+      matched++;
+    }
+  }
+  return matched / ptsA.length;
+}
+
+/**
+ * Counts how many distinct target points lie within `maxDistMeters` of a route polyline.
+ */
+export function countNearbyPoints(
+  coords: [number, number][],
+  targets: LatLng[],
+  maxDistMeters: number
+): number {
+  if (coords.length < 2 || targets.length === 0) return 0;
+
+  const n = Math.min(60, coords.length);
+  const sampled: LatLng[] = [];
+  for (let i = 0; i < n; i++) {
+    const idx = Math.min(
+      coords.length - 1,
+      Math.round((i * (coords.length - 1)) / Math.max(1, n - 1))
+    );
+    sampled.push({ lat: coords[idx][0], lon: coords[idx][1] });
+  }
+
+  let count = 0;
+  for (const target of targets) {
+    if (sampled.some((pt) => haversineMeters(pt, target) <= maxDistMeters)) {
+      count++;
+    }
+  }
+  return count;
+}

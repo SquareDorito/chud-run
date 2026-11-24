@@ -7,6 +7,7 @@ import SearchPanel from "@/components/SearchPanel";
 import RouteCard from "@/components/RouteCard";
 import ShareModal from "@/components/ShareModal";
 import type {
+  ElevationPreference,
   PlaceSuggestion,
   RouteSearchResponse,
   RunRoute,
@@ -41,6 +42,7 @@ export default function HomePage() {
     endQuery: string;
     endPlace: PlaceSuggestion | null;
     preferLoop: boolean;
+    elevationPref: ElevationPreference;
   }) => {
     setIsLoading(true);
     setError(null);

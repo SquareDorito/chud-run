@@ -12,7 +12,7 @@ import {
   Utensils,
   X,
 } from "lucide-react";
-import type { PlaceSuggestion } from "@/lib/types";
+import type { ElevationPreference, PlaceSuggestion } from "@/lib/types";
 
 interface SavedPlace {
   labelName: string;
@@ -27,6 +27,7 @@ interface SearchPanelProps {
     endQuery: string;
     endPlace: PlaceSuggestion | null;
     preferLoop: boolean;
+    elevationPref: ElevationPreference;
   }) => void;
   onStartChange?: (start: PlaceSuggestion | null) => void;
   isLoading: boolean;
@@ -75,8 +76,10 @@ export default function SearchPanel({
   const [endSuggestions, setEndSuggestions] = useState<PlaceSuggestion[]>([]);
   const [showEndDropdown, setShowEndDropdown] = useState(false);
 
-  // Route style preference
+  // Route style & terrain preference
   const [preferLoop, setPreferLoop] = useState(true);
+  const [elevationPref, setElevationPref] =
+    useState<ElevationPreference>("any");
 
   const startTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const endTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -263,6 +266,7 @@ export default function SearchPanel({
       endQuery: endText.trim(),
       endPlace: selectedEnd,
       preferLoop,
+      elevationPref,
     });
   };
 
@@ -637,34 +641,64 @@ export default function SearchPanel({
         )}
       </div>
 
-      {/* 4. ROUTE SHAPE (SINGLE CLEAN TOGGLE) */}
-      <div className="flex items-center justify-between gap-2 pt-0.5">
-        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-          Route Style
-        </span>
-        <div className="inline-flex rounded-xl bg-slate-100 p-0.5 text-[11px] font-semibold">
-          <button
-            type="button"
-            onClick={() => setPreferLoop(true)}
-            className={`px-2.5 py-1 rounded-lg transition ${
-              preferLoop
-                ? "bg-white text-slate-900 shadow-xs"
-                : "text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            Loop (unique roads)
-          </button>
-          <button
-            type="button"
-            onClick={() => setPreferLoop(false)}
-            className={`px-2.5 py-1 rounded-lg transition ${
-              !preferLoop
-                ? "bg-white text-slate-900 shadow-xs"
-                : "text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            There &amp; Back
-          </button>
+      {/* 4. ROUTE SHAPE & TERRAIN */}
+      <div className="space-y-2 pt-0.5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
+            Route Style
+          </span>
+          <div className="inline-flex rounded-xl bg-slate-100 p-0.5 text-[11px] font-semibold">
+            <button
+              type="button"
+              onClick={() => setPreferLoop(true)}
+              className={`px-2.5 py-1 rounded-lg transition ${
+                preferLoop
+                  ? "bg-white text-slate-900 shadow-xs"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              Loop (unique roads)
+            </button>
+            <button
+              type="button"
+              onClick={() => setPreferLoop(false)}
+              className={`px-2.5 py-1 rounded-lg transition ${
+                !preferLoop
+                  ? "bg-white text-slate-900 shadow-xs"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              There &amp; Back
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
+            Terrain
+          </span>
+          <div className="inline-flex rounded-xl bg-slate-100 p-0.5 text-[11px] font-semibold">
+            {(
+              [
+                { value: "any", label: "Any" },
+                { value: "flat", label: "Flat" },
+                { value: "hilly", label: "Hilly" },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setElevationPref(opt.value)}
+                className={`px-3 py-1 rounded-lg transition ${
+                  elevationPref === opt.value
+                    ? "bg-white text-slate-900 shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
