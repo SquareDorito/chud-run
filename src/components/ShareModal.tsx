@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Check,
   Copy,
   ExternalLink,
+  Loader2,
   MapPin,
   MessageCircle,
   Navigation,
@@ -20,11 +21,50 @@ import type { RunRoute } from "@/lib/types";
 
 interface ShareModalProps {
   route: RunRoute;
+  initialShareId?: string;
   onClose: () => void;
 }
 
-export default function ShareModal({ route, onClose }: ShareModalProps) {
+export default function ShareModal({
+  route,
+  initialShareId,
+  onClose,
+}: ShareModalProps) {
   const [copied, setCopied] = useState(false);
+  const [createdShareId, setCreatedShareId] = useState<string | null>(null);
+  const [shareSettled, setShareSettled] = useState(Boolean(initialShareId));
+
+  const shareId = initialShareId ?? createdShareId;
+  const creatingLink = !initialShareId && !shareSettled;
+
+  useEffect(() => {
+    if (initialShareId) return;
+
+    const controller = new AbortController();
+
+    fetch("/api/share", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ route }),
+      signal: controller.signal,
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { id?: string } | null) => {
+        if (!controller.signal.aborted && data?.id) {
+          setCreatedShareId(data.id);
+        }
+      })
+      .catch(() => {
+        // Ignore abort / network errors; fallback token URL remains available
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setShareSettled(true);
+        }
+      });
+
+    return () => controller.abort();
+  }, [route, initialShareId]);
 
   const {
     shareUrl,
@@ -34,13 +74,19 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
     googleMapsUrl,
     appleMapsUrl,
   } = useMemo(() => {
-    const token = encodeRouteToToken(route);
     const origin =
       typeof window !== "undefined" ? window.location.origin : "";
-    const url = `${origin}/r?d=${encodeURIComponent(token)}`;
-    const og = `/api/og?d=${encodeURIComponent(token)}`;
+    const fallbackToken = shareId ? null : encodeRouteToToken(route);
+    const url = shareId
+      ? `${origin}/r/${shareId}`
+      : `${origin}/r?d=${encodeURIComponent(fallbackToken!)}`;
+    const og = shareId
+      ? `/api/og?id=${encodeURIComponent(shareId)}`
+      : `/api/og?d=${encodeURIComponent(fallbackToken!)}`;
     const text = `Let's run "${route.name}" — ${route.distanceMiles.toFixed(1)} mi (${route.trafficFreePct}% traffic-free)!`;
-    const sms = `sms:&body=${encodeURIComponent(`${text}\n${url}`)}`;
+    // Send the standalone short URL in Messages so iMessage renders a rich
+    // full-bleed link preview bubble with the route map & stats card.
+    const sms = `sms:&body=${encodeURIComponent(url)}`;
     return {
       shareUrl: url,
       ogImageUrl: og,
@@ -49,9 +95,10 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
       googleMapsUrl: buildGoogleMapsWalkingUrl(route),
       appleMapsUrl: buildAppleMapsWalkingUrl(route),
     };
-  }, [route]);
+  }, [route, shareId]);
 
   const handleCopy = async () => {
+    if (creatingLink) return;
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
@@ -62,6 +109,7 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
   };
 
   const handleNativeShare = async () => {
+    if (creatingLink) return;
     if (typeof navigator !== "undefined" && navigator.share) {
       try {
         await navigator.share({
@@ -106,12 +154,19 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
         {/* Route Overview Card */}
         <div className="bg-slate-100 rounded-2xl p-2.5 mb-4">
           <div className="bg-white rounded-xl overflow-hidden shadow-xs border border-slate-200">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={ogImageUrl}
-              alt={route.name}
-              className="w-full aspect-[1200/630] object-cover bg-slate-900"
-            />
+            {creatingLink ? (
+              <div className="w-full aspect-[1200/630] bg-slate-900 flex items-center justify-center text-slate-400 text-xs gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Generating route preview...
+              </div>
+            ) : (
+              /* eslint-disable-next-line @next/next/no-img-element */
+              <img
+                src={ogImageUrl}
+                alt={route.name}
+                className="w-full aspect-[1200/630] object-cover bg-slate-900"
+              />
+            )}
             <div className="p-3">
               <div className="text-xs font-bold text-slate-900 line-clamp-1">
                 {route.name} · {route.distanceMiles.toFixed(1)} mi
@@ -161,22 +216,45 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
 
         {/* Share Actions */}
         <div className="space-y-2.5">
-          <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-            Share Route
+          <div className="flex items-center justify-between">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+              Share Route
+            </div>
+            {shareId && (
+              <span className="text-[11px] font-mono text-slate-400">
+                /r/{shareId}
+              </span>
+            )}
           </div>
           <a
-            href={smsHref}
-            className="w-full inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#34C759] hover:bg-[#2db84e] text-white font-bold text-sm transition shadow-xs"
+            href={creatingLink ? undefined : smsHref}
+            aria-disabled={creatingLink}
+            onClick={(e) => {
+              if (creatingLink) e.preventDefault();
+            }}
+            className={`w-full inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#34C759] hover:bg-[#2db84e] text-white font-bold text-sm transition shadow-xs ${
+              creatingLink ? "opacity-60 pointer-events-none" : ""
+            }`}
           >
-            <MessageCircle className="w-4 h-4" />
-            Send via Messages
+            {creatingLink ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Creating Short Link...
+              </>
+            ) : (
+              <>
+                <MessageCircle className="w-4 h-4" />
+                Send via Messages
+              </>
+            )}
           </a>
 
           <div className="grid grid-cols-2 gap-2.5">
             <button
               type="button"
               onClick={handleCopy}
-              className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold text-xs transition"
+              disabled={creatingLink}
+              className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-60 text-slate-800 font-semibold text-xs transition"
             >
               {copied ? (
                 <>
@@ -194,7 +272,8 @@ export default function ShareModal({ route, onClose }: ShareModalProps) {
             <button
               type="button"
               onClick={handleNativeShare}
-              className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl bg-[#FC4C02] hover:bg-[#e34402] text-white font-semibold text-xs transition"
+              disabled={creatingLink}
+              className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl bg-[#FC4C02] hover:bg-[#e34402] disabled:opacity-60 text-white font-semibold text-xs transition"
             >
               <Share2 className="w-4 h-4" />
               Share Sheet

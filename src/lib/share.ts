@@ -55,8 +55,8 @@ export function downsampleCoordinates(
   return result;
 }
 
-export function encodeRouteToToken(route: RunRoute): string {
-  const payload: SharedRoutePayload = {
+export function toSharedRoutePayload(route: RunRoute): SharedRoutePayload {
+  return {
     id: route.id,
     name: route.name,
     tagline: route.tagline,
@@ -82,7 +82,50 @@ export function encodeRouteToToken(route: RunRoute): string {
     foodOrArea: route.destinationFoodOrArea,
     coords: downsampleCoordinates(route.coordinates, 48),
   };
+}
 
+export function payloadToRunRoute(p: SharedRoutePayload): RunRoute | null {
+  if (!p || !Array.isArray(p.coords) || p.coords.length < 2) return null;
+
+  return {
+    id: p.id || "shared",
+    name: p.name || "Scenic Running Route",
+    tagline: p.tagline || "Traffic-free scenic run",
+    mode: p.mode || "loop",
+    distanceMiles: p.distanceMiles,
+    estimatedMinutes: p.estimatedMinutes,
+    elevationGainFt: p.elevationGainFt,
+    terrainLabel: p.terrainLabel,
+    trafficFreePct: p.trafficFreePct,
+    sceneryScore: p.sceneryScore,
+    nightScore: p.nightScore,
+    nightLabel: p.nightLabel,
+    surfaceBreakdown: {
+      carFreePct: p.carFreePct ?? p.trafficFreePct,
+      quietStreetPct: p.quietStreetPct ?? Math.max(0, 100 - p.trafficFreePct),
+      mainRoadPct: p.mainRoadPct ?? 0,
+    },
+    highlights: p.highlights || [],
+    start: {
+      label: p.startLabel,
+      shortName: p.startLabel,
+      lat: p.startLat,
+      lon: p.startLon,
+    },
+    end: {
+      label: p.endLabel,
+      shortName: p.endLabel,
+      lat: p.endLat,
+      lon: p.endLon,
+    },
+    destinationFoodOrArea: p.foodOrArea,
+    coordinates: p.coords,
+    pois: [],
+  };
+}
+
+export function encodeRouteToToken(route: RunRoute): string {
+  const payload = toSharedRoutePayload(route);
   const json = JSON.stringify(payload);
   // UTF-8 safe base64url encoding (works in Node and all browsers; avoids Buffer polyfill lacking "base64url")
   if (typeof Buffer !== "undefined" && typeof window === "undefined") {
@@ -114,43 +157,7 @@ export function decodeRouteFromToken(token: string): RunRoute | null {
     }
 
     const p = JSON.parse(json) as SharedRoutePayload;
-    if (!p || !Array.isArray(p.coords) || p.coords.length < 2) return null;
-
-    return {
-      id: p.id || "shared",
-      name: p.name || "Scenic Running Route",
-      tagline: p.tagline || "Traffic-free scenic run",
-      mode: p.mode || "loop",
-      distanceMiles: p.distanceMiles,
-      estimatedMinutes: p.estimatedMinutes,
-      elevationGainFt: p.elevationGainFt,
-      terrainLabel: p.terrainLabel,
-      trafficFreePct: p.trafficFreePct,
-      sceneryScore: p.sceneryScore,
-      nightScore: p.nightScore,
-      nightLabel: p.nightLabel,
-      surfaceBreakdown: {
-        carFreePct: p.carFreePct ?? p.trafficFreePct,
-        quietStreetPct: p.quietStreetPct ?? Math.max(0, 100 - p.trafficFreePct),
-        mainRoadPct: p.mainRoadPct ?? 0,
-      },
-      highlights: p.highlights || [],
-      start: {
-        label: p.startLabel,
-        shortName: p.startLabel,
-        lat: p.startLat,
-        lon: p.startLon,
-      },
-      end: {
-        label: p.endLabel,
-        shortName: p.endLabel,
-        lat: p.endLat,
-        lon: p.endLon,
-      },
-      destinationFoodOrArea: p.foodOrArea,
-      coordinates: p.coords,
-      pois: [],
-    };
+    return payloadToRunRoute(p);
   } catch {
     return null;
   }

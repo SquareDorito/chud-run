@@ -12,9 +12,11 @@ const RouteMap = dynamic(() => import("./RouteMap"), { ssr: false });
 
 export default function SharedRouteView({
   route,
+  shareId,
 }: {
   route: RunRoute;
-  token: string;
+  token?: string;
+  shareId?: string;
 }) {
   const [showShare, setShowShare] = useState(false);
 
@@ -164,7 +166,11 @@ export default function SharedRouteView({
       </div>
 
       {showShare && (
-        <ShareModal route={route} onClose={() => setShowShare(false)} />
+        <ShareModal
+          route={route}
+          initialShareId={shareId}
+          onClose={() => setShowShare(false)}
+        />
       )}
     </div>
   );

@@ -1,6 +1,7 @@
 import { ImageResponse } from "next/og";
 import { NextRequest } from "next/server";
 import { decodeRouteFromToken } from "@/lib/share";
+import { getSharedRouteById } from "@/lib/share-store";
 
 function projectCoordsToSvg(
   coords: [number, number][],
@@ -44,8 +45,13 @@ function projectCoordsToSvg(
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
+  const id = searchParams.get("id");
   const token = searchParams.get("d");
-  const route = token ? decodeRouteFromToken(token) : null;
+  const route = id
+    ? await getSharedRouteById(id)
+    : token
+      ? decodeRouteFromToken(token)
+      : null;
 
   if (!route) {
     return new ImageResponse(
@@ -375,6 +381,12 @@ export async function GET(req: NextRequest) {
         </div>
       </div>
     ),
-    { width: 1200, height: 630 }
+    {
+      width: 1200,
+      height: 630,
+      headers: {
+        "Cache-Control": "public, max-age=31536000, immutable",
+      },
+    }
   );
 }
