@@ -12,6 +12,7 @@ import {
   Utensils,
   X,
 } from "lucide-react";
+import { haversineMeters, metersToMiles } from "@/lib/geo";
 import type { ElevationPreference, PlaceSuggestion } from "@/lib/types";
 
 interface SavedPlace {
@@ -92,6 +93,15 @@ export default function SearchPanel({
   };
 
   const isAnyDistance = !useDistanceFilter;
+  const effectiveEndMaxMiles = useDistanceFilter ? maxMiles : SLIDER_MAX;
+  const selectedEndDistMiles =
+    selectedStart && selectedEnd
+      ? Math.round(metersToMiles(haversineMeters(selectedStart, selectedEnd)) * 10) / 10
+      : null;
+  const selectedEndOutOfRange =
+    useDistanceFilter &&
+    selectedEndDistMiles != null &&
+    selectedEndDistMiles > maxMiles;
 
   const updateSliderFromClientX = (
     clientX: number,
@@ -174,7 +184,7 @@ export default function SearchPanel({
     };
   }, [startText, selectedStart]);
 
-  // Debounced End Autocomplete (cancels stale in-flight requests)
+  // Debounced End Autocomplete (bounded to start + slider max distance; cancels stale in-flight requests)
   useEffect(() => {
     if (endTimer.current) clearTimeout(endTimer.current);
     if (!endText.trim() || selectedEnd?.shortName === endText) {
@@ -184,7 +194,7 @@ export default function SearchPanel({
     endTimer.current = setTimeout(async () => {
       try {
         const near = selectedStart
-          ? `&nearLat=${selectedStart.lat}&nearLon=${selectedStart.lon}`
+          ? `&nearLat=${selectedStart.lat}&nearLon=${selectedStart.lon}&maxMiles=${effectiveEndMaxMiles}`
           : "";
         const res = await fetch(
           `/api/geocode?q=${encodeURIComponent(endText.trim())}${near}`,
@@ -197,12 +207,12 @@ export default function SearchPanel({
       } catch {
         // ignore abort / network errors
       }
-    }, 300);
+    }, 280);
     return () => {
       if (endTimer.current) clearTimeout(endTimer.current);
       controller.abort();
     };
-  }, [endText, selectedEnd, selectedStart]);
+  }, [endText, selectedEnd, selectedStart, effectiveEndMaxMiles]);
 
   const handleUseMyLocation = () => {
     if (!navigator.geolocation) return;
@@ -269,13 +279,15 @@ export default function SearchPanel({
     setShowStartDropdown(false);
     setShowEndDropdown(false);
 
+    const hasEndDestination = endText.trim().length > 0 || selectedEnd !== null;
+
     onSearch({
       start: startToUse,
       minMiles: isAnyDistance ? null : minMiles,
       maxMiles: isAnyDistance ? null : maxMiles,
       endQuery: endText.trim(),
       endPlace: selectedEnd,
-      preferLoop,
+      preferLoop: hasEndDestination ? true : preferLoop,
       elevationPref,
     });
   };
@@ -584,15 +596,22 @@ export default function SearchPanel({
         </div>
       </div>
 
-      {/* 3. END DESTINATION / FOOD / AREA (OPTIONAL) */}
+      {/* 3. END DESTINATION / FOOD / KEYWORD (OPTIONAL) */}
       <div className="relative">
-        <label className="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-slate-500 mb-1.5">
-          <Utensils className="w-3.5 h-3.5 text-slate-400" />
-          End Destination, Food, or Area{" "}
-          <span className="font-normal normal-case text-slate-400">
-            (optional)
-          </span>
-        </label>
+        <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-500 mb-1.5">
+          <label className="flex items-center gap-1">
+            <Utensils className="w-3.5 h-3.5 text-slate-400" />
+            End Place or Keyword{" "}
+            <span className="font-normal normal-case text-slate-400">
+              (optional)
+            </span>
+          </label>
+          {selectedStart && (
+            <span className="text-[10px] font-semibold normal-case text-slate-400">
+              Within {effectiveEndMaxMiles % 1 === 0 ? effectiveEndMaxMiles.toFixed(0) : effectiveEndMaxMiles.toFixed(1)} mi
+            </span>
+          )}
+        </div>
 
         <div className="relative flex items-center">
           <Search className="w-4 h-4 text-[#FC4C02] absolute left-3 pointer-events-none" />
@@ -605,9 +624,9 @@ export default function SearchPanel({
               setShowEndDropdown(true);
             }}
             onFocus={() => {
-              if (endSuggestions.length > 0) setShowEndDropdown(true);
+              if (endText.trim().length >= 2) setShowEndDropdown(true);
             }}
-            placeholder="Address, neighborhood, or food (e.g. tacos, coffee)..."
+            placeholder="Keyword (pizza, coffee, park) or specific place..."
             className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-[#FC4C02] focus:ring-2 focus:ring-[#FC4C02]/15 transition"
           />
           {endText && (
@@ -617,6 +636,7 @@ export default function SearchPanel({
                 setEndText("");
                 setSelectedEnd(null);
                 setEndSuggestions([]);
+                setShowEndDropdown(false);
               }}
               className="absolute right-2.5 text-slate-400 hover:text-slate-600"
             >
@@ -625,28 +645,89 @@ export default function SearchPanel({
           )}
         </div>
 
-        {/* End Autocomplete Dropdown */}
-        {showEndDropdown && endSuggestions.length > 0 && endText.trim().length > 2 && (
-          <div className="absolute z-30 left-0 right-0 mt-1 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden max-h-48 overflow-y-auto">
-            {endSuggestions.map((place, idx) => (
-              <button
-                key={`${place.lat}-${place.lon}-${idx}`}
-                type="button"
-                onClick={() => {
-                  setSelectedEnd(place);
-                  setEndText(place.shortName);
-                  setShowEndDropdown(false);
-                }}
-                className="w-full text-left px-3.5 py-2 hover:bg-orange-50/70 border-b border-slate-100 last:border-b-0 transition"
-              >
-                <div className="text-xs font-semibold text-slate-900">
-                  {place.shortName}
+        {/* Inline mode hint or out-of-range warning */}
+        {selectedEndOutOfRange && selectedEnd && (
+          <div className="mt-1.5 flex items-center justify-between gap-2 rounded-lg bg-amber-50 border border-amber-200 px-2.5 py-1.5 text-[11px] text-amber-800">
+            <span>
+              <strong>{selectedEnd.shortName}</strong> is ~{selectedEndDistMiles} mi away (over {maxMiles} mi max).
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedEnd(null);
+                setShowEndDropdown(true);
+              }}
+              className="shrink-0 font-bold text-[#FC4C02] hover:underline cursor-pointer"
+            >
+              Use keyword
+            </button>
+          </div>
+        )}
+        {!selectedEndOutOfRange && !showEndDropdown && endText.trim().length >= 2 && !selectedEnd && (
+          <p className="mt-1 text-[11px] text-slate-500">
+            Keyword search: will find nearby &ldquo;{endText.trim()}&rdquo; spots within{" "}
+            {effectiveEndMaxMiles % 1 === 0 ? effectiveEndMaxMiles.toFixed(0) : effectiveEndMaxMiles.toFixed(1)} mi.
+          </p>
+        )}
+
+        {/* End Autocomplete & Keyword Search Dropdown */}
+        {showEndDropdown && endText.trim().length >= 2 && (
+          <div className="absolute z-30 left-0 right-0 mt-1 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden max-h-60 overflow-y-auto">
+            {/* Explicit Keyword Search option */}
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedEnd(null);
+                setShowEndDropdown(false);
+              }}
+              className="w-full text-left px-3.5 py-2.5 bg-orange-50/60 hover:bg-orange-50 border-b border-slate-200 transition flex items-center gap-2.5 cursor-pointer"
+            >
+              <Search className="w-3.5 h-3.5 text-[#FC4C02] shrink-0" />
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-slate-900 truncate">
+                  Search nearby for &ldquo;{endText.trim()}&rdquo;
                 </div>
-                <div className="text-[11px] text-slate-500 truncate">
-                  {place.label}
+                <div className="text-[11px] text-slate-500">
+                  Keyword search · spots within{" "}
+                  {effectiveEndMaxMiles % 1 === 0 ? effectiveEndMaxMiles.toFixed(0) : effectiveEndMaxMiles.toFixed(1)} mi
                 </div>
-              </button>
-            ))}
+              </div>
+            </button>
+
+            {endSuggestions.length > 0 ? (
+              endSuggestions.map((place, idx) => (
+                <button
+                  key={`${place.lat}-${place.lon}-${idx}`}
+                  type="button"
+                  onClick={() => {
+                    setSelectedEnd(place);
+                    setEndText(place.shortName);
+                    setShowEndDropdown(false);
+                  }}
+                  className="w-full text-left px-3.5 py-2 hover:bg-orange-50/70 border-b border-slate-100 last:border-b-0 transition cursor-pointer"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-xs font-semibold text-slate-900 truncate">
+                      {place.shortName}
+                    </div>
+                    {place.distanceMiles != null && (
+                      <span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded-md shrink-0">
+                        {place.distanceMiles.toFixed(1)} mi
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    {place.label}
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="px-3.5 py-2.5 text-[11px] text-slate-500">
+                {selectedStart
+                  ? `No exact place within ${effectiveEndMaxMiles % 1 === 0 ? effectiveEndMaxMiles.toFixed(0) : effectiveEndMaxMiles.toFixed(1)} mi — tap above or hit Find Scenic Routes to search by keyword.`
+                  : "Pick a Start Location first to filter places by distance, or tap above for keyword search."}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -657,30 +738,36 @@ export default function SearchPanel({
           <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
             Route Style
           </span>
-          <div className="inline-flex rounded-xl bg-slate-100 p-0.5 text-[11px] font-semibold">
-            <button
-              type="button"
-              onClick={() => setPreferLoop(true)}
-              className={`px-2.5 py-1 rounded-lg transition ${
-                preferLoop
-                  ? "bg-white text-slate-900 shadow-xs"
-                  : "text-slate-500 hover:text-slate-800"
-              }`}
-            >
-              Loop (unique roads)
-            </button>
-            <button
-              type="button"
-              onClick={() => setPreferLoop(false)}
-              className={`px-2.5 py-1 rounded-lg transition ${
-                !preferLoop
-                  ? "bg-white text-slate-900 shadow-xs"
-                  : "text-slate-500 hover:text-slate-800"
-              }`}
-            >
-              There &amp; Back
-            </button>
-          </div>
+          {endText.trim().length > 0 || selectedEnd ? (
+            <div className="inline-flex items-center rounded-xl bg-slate-100 px-3 py-1 text-[11px] font-semibold text-slate-700">
+              One-way (unique roads)
+            </div>
+          ) : (
+            <div className="inline-flex rounded-xl bg-slate-100 p-0.5 text-[11px] font-semibold">
+              <button
+                type="button"
+                onClick={() => setPreferLoop(true)}
+                className={`px-2.5 py-1 rounded-lg transition ${
+                  preferLoop
+                    ? "bg-white text-slate-900 shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                Loop (unique roads)
+              </button>
+              <button
+                type="button"
+                onClick={() => setPreferLoop(false)}
+                className={`px-2.5 py-1 rounded-lg transition ${
+                  !preferLoop
+                    ? "bg-white text-slate-900 shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                There &amp; Back
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center justify-between gap-2">

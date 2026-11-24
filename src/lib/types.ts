@@ -11,6 +11,7 @@ export interface PlaceSuggestion {
   type?: string;
   rating?: number;
   ratingCount?: number;
+  distanceMiles?: number;
 }
 
 export interface ScenicPOI {

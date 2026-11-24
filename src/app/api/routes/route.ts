@@ -744,6 +744,18 @@ const PHOTON_FOOD_VALUES = new Set([
   "convenience",
 ]);
 
+function computeBoundingBox(center: LatLng, radiusMeters: number) {
+  const dLat = radiusMeters / 111320;
+  const cosLat = Math.max(0.15, Math.cos((center.lat * Math.PI) / 180));
+  const dLon = radiusMeters / (111320 * cosLat);
+  return {
+    minLon: center.lon - dLon,
+    minLat: center.lat - dLat,
+    maxLon: center.lon + dLon,
+    maxLat: center.lat + dLat,
+  };
+}
+
 async function resolveFoodViaPhoton(
   start: LatLng,
   endQuery: string,
@@ -753,7 +765,9 @@ async function resolveFoodViaPhoton(
   maxResults = 4
 ): Promise<PlaceSuggestion[]> {
   try {
-    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(endQuery)}&lat=${start.lat}&lon=${start.lon}&limit=25`;
+    const bbox = computeBoundingBox(start, maxAllowedDist);
+    const bboxParam = `&bbox=${bbox.minLon.toFixed(5)},${bbox.minLat.toFixed(5)},${bbox.maxLon.toFixed(5)},${bbox.maxLat.toFixed(5)}`;
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(endQuery)}&lat=${start.lat}&lon=${start.lon}${bboxParam}&limit=25`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(2600),
@@ -774,16 +788,27 @@ async function resolveFoodViaPhoton(
     };
 
     const expandedTerms = expandFoodTerms(endQuery);
+    const queryTokens = endQuery
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .split(/\s+/)
+      .filter((t) => t.length >= 2);
 
     const candidates = (data.features || [])
       .map((f) => {
         const coords = f.geometry?.coordinates;
         const props = f.properties;
         if (!coords || coords.length < 2 || !props?.name) return null;
-        // Filter out non-food noise (hotels, schools, offices, streets, flooring shops, etc.)
+        // Filter out non-food noise (hotels, schools, offices, streets, auto shops, etc.)
         const osmKey = (props.osm_key || "").toLowerCase();
         const osmVal = (props.osm_value || "").toLowerCase();
-        if (PHOTON_NON_FOOD_KEYS.has(osmKey) || PHOTON_NON_FOOD_VALUES.has(osmVal)) {
+        if (
+          PHOTON_NON_FOOD_KEYS.has(osmKey) ||
+          PHOTON_NON_FOOD_VALUES.has(osmVal) ||
+          osmVal === "car_repair" ||
+          osmVal === "car_parts" ||
+          osmVal === "car"
+        ) {
           return null;
         }
         const isFoodOsm =
@@ -797,13 +822,18 @@ async function resolveFoodViaPhoton(
         const [lon, lat] = coords;
         const dist = haversineMeters(start, { lat, lon });
         if (dist > maxAllowedDist || dist < 120) return null;
+        // Reward closer match to full query tokens (e.g. "Freddy's Pizza" > generic "Pizza")
+        const matchedTokens = queryTokens.filter((t) => nameLower.includes(t)).length;
+        const tokenBonus =
+          queryTokens.length > 0 ? (matchedTokens / queryTokens.length) * 1400 : 0;
         // Prefer spots close to idealMeters and inside [minStraightMeters, maxAllowedDist]
         const rangeMissPenalty =
           dist < minStraightMeters ? (minStraightMeters - dist) * 1.4 : 0;
         const score =
           Math.abs(dist - idealMeters) +
           rangeMissPenalty -
-          (PHOTON_FOOD_VALUES.has(osmVal) ? 500 : 0);
+          (PHOTON_FOOD_VALUES.has(osmVal) ? 500 : 0) -
+          tokenBonus;
         return {
           name: props.name,
           area: props.district || props.city || props.street || "",
@@ -838,6 +868,94 @@ async function resolveFoodViaPhoton(
   }
 }
 
+async function resolveKeywordViaPhoton(
+  start: LatLng,
+  endQuery: string,
+  idealMeters: number,
+  minStraightMeters: number,
+  maxAllowedDist: number,
+  maxResults = 4
+): Promise<PlaceSuggestion[]> {
+  try {
+    const bbox = computeBoundingBox(start, maxAllowedDist);
+    const bboxParam = `&bbox=${bbox.minLon.toFixed(5)},${bbox.minLat.toFixed(5)},${bbox.maxLon.toFixed(5)},${bbox.maxLat.toFixed(5)}`;
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(endQuery)}&lat=${start.lat}&lon=${start.lon}${bboxParam}&limit=20`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: AbortSignal.timeout(2600),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      features?: {
+        geometry?: { coordinates?: [number, number] };
+        properties?: {
+          name?: string;
+          osm_key?: string;
+          osm_value?: string;
+          street?: string;
+          city?: string;
+          district?: string;
+        };
+      }[];
+    };
+
+    const queryTokens = endQuery
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .split(/\s+/)
+      .filter((t) => t.length >= 2);
+
+    const candidates = (data.features || [])
+      .map((f) => {
+        const coords = f.geometry?.coordinates;
+        const props = f.properties;
+        if (!coords || coords.length < 2 || !props?.name) return null;
+        const osmVal = (props.osm_value || "").toLowerCase();
+        if (NOISE_POI_TYPES.has(osmVal)) return null;
+        const [lon, lat] = coords;
+        const dist = haversineMeters(start, { lat, lon });
+        if (dist > maxAllowedDist || dist < 120) return null;
+        const nameLower = props.name.toLowerCase();
+        const matchedTokens = queryTokens.filter((t) => nameLower.includes(t)).length;
+        const tokenBonus =
+          queryTokens.length > 0 ? (matchedTokens / queryTokens.length) * 1200 : 0;
+        const rangeMissPenalty =
+          dist < minStraightMeters ? (minStraightMeters - dist) * 1.4 : 0;
+        return {
+          name: props.name,
+          area: props.district || props.city || props.street || "",
+          lat,
+          lon,
+          type: osmVal || props.osm_key || "place",
+          score: Math.abs(dist - idealMeters) + rangeMissPenalty - tokenBonus,
+        };
+      })
+      .filter((c): c is NonNullable<typeof c> => c !== null)
+      .sort((a, b) => a.score - b.score);
+
+    const picked: PlaceSuggestion[] = [];
+    for (const c of candidates) {
+      const isDup = picked.some(
+        (p) =>
+          p.shortName.toLowerCase() === c.name.toLowerCase() ||
+          haversineMeters(p, c) < 120
+      );
+      if (isDup) continue;
+      picked.push({
+        label: c.area ? `${c.name} (${c.area})` : c.name,
+        shortName: c.name,
+        lat: c.lat,
+        lon: c.lon,
+        type: c.type,
+      });
+      if (picked.length >= maxResults) break;
+    }
+    return picked;
+  } catch {
+    return [];
+  }
+}
+
 async function resolveEndPlaces(
   start: LatLng,
   endQuery: string,
@@ -857,7 +975,7 @@ async function resolveEndPlaces(
       : 300;
   const maxAllowedDist =
     typeof maxMiles === "number" && maxMiles > 0
-      ? Math.max(milesToMeters(maxMiles) * 0.92, 2500)
+      ? milesToMeters(maxMiles) * 0.88
       : Math.min(Math.max(Math.round(idealMeters * 1.6), 4500), 12000);
   const searchRadius = Math.min(Math.round(maxAllowedDist * 1.05), 14000);
   const foodQuery = isFoodOrVibeQuery(endQuery);
@@ -962,8 +1080,8 @@ async function resolveEndPlaces(
   }
 
   // 2. Bounded Nominatim search near start (handles addresses, neighborhoods, directional sub-areas, & local keyword fallback)
-  const delta = 0.16; // ~17km box
-  const viewbox = `${start.lon - delta},${start.lat + delta},${start.lon + delta},${start.lat - delta}`;
+  const nomBox = computeBoundingBox(start, Math.max(maxAllowedDist, 1500));
+  const viewbox = `${nomBox.minLon.toFixed(5)},${nomBox.maxLat.toFixed(5)},${nomBox.maxLon.toFixed(5)},${nomBox.minLat.toFixed(5)}`;
 
   const queryNominatim = async (q: string, bounded: boolean) => {
     const boundParam = bounded ? "&bounded=1" : "";
@@ -1115,7 +1233,20 @@ async function resolveEndPlaces(
     // ignore
   }
 
-  // 3. Final fuzzy keyword fallback via Google Places (handles non-food keywords like "bookstore", "farmers market", "falafel")
+  // 3. Keyless bounded Photon fallback for general non-food keywords (e.g. "bookstore", "library", "pier", "falafel")
+  if (!foodQuery) {
+    const photonKeywords = await resolveKeywordViaPhoton(
+      start,
+      endQuery,
+      idealMeters,
+      minStraightMeters,
+      maxAllowedDist,
+      maxFoodResults
+    );
+    if (photonKeywords.length > 0) return photonKeywords;
+  }
+
+  // 4. Final fuzzy keyword fallback via Google Places (if configured)
   if (!foodQuery && process.env.GOOGLE_PLACES_API_KEY) {
     const fuzzySpots = await resolveFoodViaGooglePlaces(
       start,
@@ -1844,7 +1975,7 @@ export async function POST(req: NextRequest) {
           sceneryScore: analysis.sceneryScore,
           nightScore: night.nightScore,
           nightLabel: night.nightLabel,
-          uniquePathPct: preferLoop ? analysis.uniquePathPct : undefined,
+          uniquePathPct: analysis.uniquePathPct,
           trafficLights,
           waterFountains,
           restrooms,
@@ -2135,7 +2266,9 @@ export async function POST(req: NextRequest) {
         }
       }
       const repeatBonus =
-        preferLoop && !r.lapInfo ? (r.uniquePathPct ?? 100) * 0.3 : 0;
+        (preferLoop || r.mode === "point-to-point") && !r.lapInfo
+          ? (r.uniquePathPct ?? 100) * 0.3
+          : 0;
       const nightTieBreaker = (r.nightScore ?? 60) * 0.08;
       const trackMatchBonus = r.lapInfo && rangePenalty === 0 ? 6 : 0;
 
@@ -2186,12 +2319,14 @@ export async function POST(req: NextRequest) {
 
     routes.sort((a, b) => scoreRoute(b) - scoreRoute(a));
 
-    // When a distance range is set for a fuzzy end query (e.g. "pizza" 6–8 mi), drop wildly out-of-range routes
+    // When a distance range is set for a fuzzy end query (e.g. "pizza" 3–5 mi), drop out-of-range routes
     const candidateRoutes =
       hasRange && !endPlace && resolvedEnds.length > 0 && typeof maxMiles === "number"
         ? (() => {
-            const withinCap = routes.filter((r) => r.distanceMiles <= maxMiles * 1.35);
-            return withinCap.length > 0 ? withinCap : routes;
+            const withinStrict = routes.filter((r) => r.distanceMiles <= maxMiles * 1.12);
+            if (withinStrict.length > 0) return withinStrict;
+            const withinSoft = routes.filter((r) => r.distanceMiles <= maxMiles * 1.3);
+            return withinSoft.length > 0 ? withinSoft : routes;
           })()
         : routes;
 
@@ -2239,7 +2374,9 @@ export async function POST(req: NextRequest) {
       resolvedEnd,
       note:
         endQuery && !resolvedEnd
-          ? `Couldn't find an exact match for "${endQuery}" nearby — showing scenic loops from your start instead.`
+          ? hasRange && typeof maxMiles === "number"
+            ? `Couldn't find "${endQuery}" within ${maxMiles} mi — showing scenic loops from your start instead.`
+            : `Couldn't find an exact match for "${endQuery}" nearby — showing scenic loops from your start instead.`
           : undefined,
     });
   } catch (err) {

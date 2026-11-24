@@ -1,9 +1,63 @@
 import { NextRequest, NextResponse } from "next/server";
+import { haversineMeters, metersToMiles, milesToMeters } from "@/lib/geo";
 import type { PlaceSuggestion } from "@/lib/types";
 
 const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
 const PHOTON_BASE = "https://photon.komoot.io/api/";
 const USER_AGENT = "ChudRun/1.0 (scenic running route planner)";
+
+const GEOCODE_FOOD_HINT_REGEX =
+  /\b(pizza|pizzeria|taco|tacos|coffee|cafe|espresso|latte|matcha|tea|ramen|sushi|noodle|burger|burgers|bagel|bagels|bakery|pastry|donut|donuts|ice cream|gelato|boba|smoothie|sandwich|deli|brunch|breakfast|brewery|bar|pub|restaurant|food|thai|indian|italian|korean|mexican|pho|dim sum|dumpling|falafel)\b/i;
+
+const NON_FOOD_OSM_VALUES = new Set([
+  "car_repair",
+  "car",
+  "car_parts",
+  "tyres",
+  "fuel",
+  "parking",
+  "dentist",
+  "doctors",
+  "clinic",
+  "hospital",
+  "pharmacy",
+  "school",
+  "college",
+  "university",
+  "bank",
+  "atm",
+  "funeral_directors",
+  "storage_rental",
+  "laundry",
+  "dry_cleaning",
+]);
+
+function computeBoundingBox(lat: number, lon: number, radiusMeters: number) {
+  const dLat = radiusMeters / 111320;
+  const cosLat = Math.max(0.15, Math.cos((lat * Math.PI) / 180));
+  const dLon = radiusMeters / (111320 * cosLat);
+  return {
+    minLon: lon - dLon,
+    minLat: lat - dLat,
+    maxLon: lon + dLon,
+    maxLat: lat + dLat,
+  };
+}
+
+function queryTokenMatchScore(query: string, text: string): number {
+  const tokens = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  if (tokens.length === 0) return 0;
+  const hay = text.toLowerCase();
+  let matched = 0;
+  for (const t of tokens) {
+    if (hay.includes(t)) matched++;
+  }
+  return matched / tokens.length;
+}
 
 const GEOCODE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const GEOCODE_CACHE_MAX = 400;
@@ -100,31 +154,66 @@ function formatPhotonPlace(f: PhotonFeature): PlaceSuggestion | null {
 async function searchPhoton(
   q: string,
   nearLat?: number,
-  nearLon?: number
+  nearLon?: number,
+  maxMeters?: number
 ): Promise<PlaceSuggestion[]> {
   try {
-    const bias =
-      nearLat != null && nearLon != null
-        ? `&lat=${nearLat}&lon=${nearLon}`
-        : "";
-    const url = `${PHOTON_BASE}?q=${encodeURIComponent(q)}&limit=6${bias}`;
+    const hasOrigin = nearLat != null && nearLon != null;
+    const bias = hasOrigin ? `&lat=${nearLat}&lon=${nearLon}` : "";
+    let bboxParam = "";
+    if (hasOrigin && maxMeters != null) {
+      const box = computeBoundingBox(nearLat, nearLon, maxMeters);
+      bboxParam = `&bbox=${box.minLon.toFixed(5)},${box.minLat.toFixed(5)},${box.maxLon.toFixed(5)},${box.maxLat.toFixed(5)}`;
+    }
+    const limit = maxMeters != null ? 15 : 6;
+    const url = `${PHOTON_BASE}?q=${encodeURIComponent(q)}&limit=${limit}${bias}${bboxParam}`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(2200),
     });
     if (!res.ok) return [];
     const data = (await res.json()) as { features?: PhotonFeature[] };
+    const isFoodLike = GEOCODE_FOOD_HINT_REGEX.test(q);
     const seen = new Set<string>();
-    const places: PlaceSuggestion[] = [];
+    const scored: { place: PlaceSuggestion; rank: number }[] = [];
+
     for (const f of data.features || []) {
       const place = formatPhotonPlace(f);
       if (!place) continue;
+      const osmVal = (f.properties?.osm_value || "").toLowerCase();
+      if (isFoodLike && NON_FOOD_OSM_VALUES.has(osmVal)) {
+        continue;
+      }
+
+      let distMeters: number | undefined;
+      if (hasOrigin) {
+        distMeters = haversineMeters(
+          { lat: nearLat, lon: nearLon },
+          { lat: place.lat, lon: place.lon }
+        );
+        if (maxMeters != null && distMeters > maxMeters) {
+          continue;
+        }
+        place.distanceMiles = Math.round(metersToMiles(distMeters) * 10) / 10;
+      }
+
       const key = `${place.shortName.toLowerCase()}|${place.lat.toFixed(3)},${place.lon.toFixed(3)}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      places.push(place);
+
+      const tokenScore = queryTokenMatchScore(
+        q,
+        `${place.shortName} ${place.label}`
+      );
+      const distPenalty = distMeters != null ? distMeters / 25000 : 0;
+      scored.push({ place, rank: tokenScore * 3 - distPenalty });
     }
-    return places;
+
+    if (hasOrigin) {
+      scored.sort((a, b) => b.rank - a.rank);
+    }
+
+    return scored.slice(0, 6).map((s) => s.place);
   } catch {
     return [];
   }
@@ -133,28 +222,52 @@ async function searchPhoton(
 async function searchNominatim(
   q: string,
   nearLat?: number,
-  nearLon?: number
+  nearLon?: number,
+  maxMeters?: number
 ): Promise<PlaceSuggestion[]> {
   try {
+    const hasOrigin = nearLat != null && nearLon != null;
     let viewboxParam = "";
-    if (nearLat != null && nearLon != null) {
-      const delta = 0.18; // ~20km box
-      viewboxParam = `&viewbox=${nearLon - delta},${nearLat + delta},${nearLon + delta},${nearLat - delta}`;
+    if (hasOrigin) {
+      if (maxMeters != null) {
+        const box = computeBoundingBox(nearLat, nearLon, maxMeters);
+        viewboxParam = `&viewbox=${box.minLon.toFixed(5)},${box.maxLat.toFixed(5)},${box.maxLon.toFixed(5)},${box.minLat.toFixed(5)}&bounded=1`;
+      } else {
+        const delta = 0.18; // ~20km box
+        viewboxParam = `&viewbox=${nearLon - delta},${nearLat + delta},${nearLon + delta},${nearLat - delta}`;
+      }
     }
-    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=6${viewboxParam}`;
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=8${viewboxParam}`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(3000),
     });
     if (!res.ok) return [];
     const items = (await res.json()) as NominatimItem[];
-    return items.map((item) => ({
-      label: item.display_name,
-      shortName: formatShortName(item),
-      lat: parseFloat(item.lat),
-      lon: parseFloat(item.lon),
-      type: item.type,
-    }));
+    const places: PlaceSuggestion[] = [];
+    for (const item of items) {
+      const lat = parseFloat(item.lat);
+      const lon = parseFloat(item.lon);
+      let distanceMiles: number | undefined;
+      if (hasOrigin) {
+        const dist = haversineMeters(
+          { lat: nearLat, lon: nearLon },
+          { lat, lon }
+        );
+        if (maxMeters != null && dist > maxMeters) continue;
+        distanceMiles = Math.round(metersToMiles(dist) * 10) / 10;
+      }
+      places.push({
+        label: item.display_name,
+        shortName: formatShortName(item),
+        lat,
+        lon,
+        type: item.type,
+        distanceMiles,
+      });
+      if (places.length >= 6) break;
+    }
+    return places;
   } catch {
     return [];
   }
@@ -201,21 +314,31 @@ export async function GET(req: NextRequest) {
 
     const nearLatRaw = searchParams.get("nearLat");
     const nearLonRaw = searchParams.get("nearLon");
+    const maxMilesRaw = searchParams.get("maxMiles");
     const parsedLat = nearLatRaw ? parseFloat(nearLatRaw) : NaN;
     const parsedLon = nearLonRaw ? parseFloat(nearLonRaw) : NaN;
+    const parsedMaxMiles = maxMilesRaw ? parseFloat(maxMilesRaw) : NaN;
     const nearLat = Number.isNaN(parsedLat) ? undefined : parsedLat;
     const nearLon = Number.isNaN(parsedLon) ? undefined : parsedLon;
+    const maxMiles =
+      !Number.isNaN(parsedMaxMiles) && parsedMaxMiles > 0
+        ? Math.min(Math.max(parsedMaxMiles, 0.5), 30)
+        : undefined;
+    const maxMeters =
+      nearLat != null && nearLon != null && maxMiles != null
+        ? milesToMeters(maxMiles)
+        : undefined;
 
-    const cacheKey = `q:${q.toLowerCase()}|${nearLat != null ? nearLat.toFixed(2) : ""},${nearLon != null ? nearLon.toFixed(2) : ""}`;
+    const cacheKey = `q:${q.toLowerCase()}|${nearLat != null ? nearLat.toFixed(2) : ""},${nearLon != null ? nearLon.toFixed(2) : ""}|${maxMiles != null ? maxMiles.toFixed(1) : ""}`;
     const cached = geocodeCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       return NextResponse.json({ places: cached.places });
     }
 
-    // Photon primary (fast typeahead + native proximity bias); Nominatim fallback for misses or exact street numbers
-    let places = await searchPhoton(q, nearLat, nearLon);
+    // Photon primary (fast typeahead + native proximity & bbox); Nominatim fallback for misses or exact street numbers
+    let places = await searchPhoton(q, nearLat, nearLon, maxMeters);
     if (places.length === 0) {
-      places = await searchNominatim(q, nearLat, nearLon);
+      places = await searchNominatim(q, nearLat, nearLon, maxMeters);
     }
 
     if (places.length > 0) {
