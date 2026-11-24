@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { ChevronDown, ChevronUp, ShieldCheck } from "lucide-react";
 import SearchPanel from "@/components/SearchPanel";
@@ -34,6 +34,7 @@ export default function HomePage() {
   const [note, setNote] = useState<string | null>(null);
   const [shareRoute, setShareRoute] = useState<RunRoute | null>(null);
   const [mobileSheetExpanded, setMobileSheetExpanded] = useState(true);
+  const searchAbortRef = useRef<AbortController | null>(null);
 
   const handleSearch = async (params: {
     start: PlaceSuggestion;
@@ -44,6 +45,13 @@ export default function HomePage() {
     preferLoop: boolean;
     elevationPref: ElevationPreference;
   }) => {
+    // Cancel any previous in-flight route search so stale responses never overwrite newer ones
+    if (searchAbortRef.current) {
+      searchAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+
     setIsLoading(true);
     setError(null);
     setNote(null);
@@ -53,11 +61,13 @@ export default function HomePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(params),
+        signal: controller.signal,
       });
 
       const data = (await res.json()) as RouteSearchResponse & {
         error?: string;
       };
+      if (controller.signal.aborted) return;
 
       if (!res.ok || data.error) {
         setError(data.error || "Could not find routes for this location.");
@@ -73,10 +83,14 @@ export default function HomePage() {
       setVisibleCount(3);
       setActiveRouteId(data.routes[0].id);
       if (data.note) setNote(data.note);
-    } catch {
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (controller.signal.aborted) return;
       setError("Network error while finding routes. Please try again.");
     } finally {
-      setIsLoading(false);
+      if (searchAbortRef.current === controller) {
+        setIsLoading(false);
+      }
     }
   };
 

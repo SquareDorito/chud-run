@@ -146,51 +146,61 @@ export default function SearchPanel({
     persistSavedStarts(savedStarts.filter((s) => s.labelName !== labelName));
   };
 
-  // Debounced Start Autocomplete
+  // Debounced Start Autocomplete (cancels stale in-flight requests)
   useEffect(() => {
     if (startTimer.current) clearTimeout(startTimer.current);
     if (!startText.trim() || selectedStart?.shortName === startText) {
       return;
     }
+    const controller = new AbortController();
     startTimer.current = setTimeout(async () => {
       try {
         const res = await fetch(
-          `/api/geocode?q=${encodeURIComponent(startText.trim())}`
+          `/api/geocode?q=${encodeURIComponent(startText.trim())}`,
+          { signal: controller.signal }
         );
         const data = (await res.json()) as { places?: PlaceSuggestion[] };
-        setStartSuggestions(data.places || []);
-        setShowStartDropdown(true);
+        if (!controller.signal.aborted) {
+          setStartSuggestions(data.places || []);
+          setShowStartDropdown(true);
+        }
       } catch {
-        // ignore
+        // ignore abort / network errors
       }
-    }, 320);
+    }, 280);
     return () => {
       if (startTimer.current) clearTimeout(startTimer.current);
+      controller.abort();
     };
   }, [startText, selectedStart]);
 
-  // Debounced End Autocomplete
+  // Debounced End Autocomplete (cancels stale in-flight requests)
   useEffect(() => {
     if (endTimer.current) clearTimeout(endTimer.current);
     if (!endText.trim() || selectedEnd?.shortName === endText) {
       return;
     }
+    const controller = new AbortController();
     endTimer.current = setTimeout(async () => {
       try {
         const near = selectedStart
           ? `&nearLat=${selectedStart.lat}&nearLon=${selectedStart.lon}`
           : "";
         const res = await fetch(
-          `/api/geocode?q=${encodeURIComponent(endText.trim())}${near}`
+          `/api/geocode?q=${encodeURIComponent(endText.trim())}${near}`,
+          { signal: controller.signal }
         );
         const data = (await res.json()) as { places?: PlaceSuggestion[] };
-        setEndSuggestions(data.places || []);
+        if (!controller.signal.aborted) {
+          setEndSuggestions(data.places || []);
+        }
       } catch {
-        // ignore
+        // ignore abort / network errors
       }
-    }, 350);
+    }, 300);
     return () => {
       if (endTimer.current) clearTimeout(endTimer.current);
+      controller.abort();
     };
   }, [endText, selectedEnd, selectedStart]);
 

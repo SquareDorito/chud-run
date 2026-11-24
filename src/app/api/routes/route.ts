@@ -22,9 +22,41 @@ import type {
 } from "@/lib/types";
 
 const OSRM_FOOT_BASE = "https://routing.openstreetmap.de/routed-foot/route/v1/foot";
-const OVERPASS_BASE = "https://overpass-api.de/api/interpreter";
+const OVERPASS_MIRRORS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
 const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
 const USER_AGENT = "ChudRun/1.0 (scenic running route planner)";
+
+async function fetchOverpassWithMirror(
+  query: string,
+  primaryTimeoutMs = 2400
+): Promise<{ elements?: OverpassElement[] } | null> {
+  const body = `data=${encodeURIComponent(query)}`;
+  for (let i = 0; i < OVERPASS_MIRRORS.length; i++) {
+    const endpoint = OVERPASS_MIRRORS[i];
+    const timeoutMs = i === 0 ? primaryTimeoutMs : 2200;
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": USER_AGENT,
+        },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) continue;
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("json")) continue;
+      return (await res.json()) as { elements?: OverpassElement[] };
+    } catch {
+      // try next mirror
+    }
+  }
+  return null;
+}
 
 interface OverpassElement {
   type: string;
@@ -188,17 +220,16 @@ function extractParkTraversePoints(
 const OVERPASS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const OVERPASS_CACHE_MAX = 200;
 
-const scenicFeatureCache = new Map<
-  string,
-  {
-    expiresAt: number;
-    data: { pois: ScenicPOI[]; parks: ParkGeometry[]; tracks: TrackGeometry[] };
-  }
->();
+interface AreaContextData {
+  pois: ScenicPOI[];
+  parks: ParkGeometry[];
+  tracks: TrackGeometry[];
+  envSignals: RouteEnvironmentSignals;
+}
 
-const envSignalsCache = new Map<
+const areaContextCache = new Map<
   string,
-  { expiresAt: number; data: RouteEnvironmentSignals }
+  { expiresAt: number; data: AreaContextData }
 >();
 
 function overpassGridKey(center: LatLng, radiusMeters: number): string {
@@ -206,17 +237,33 @@ function overpassGridKey(center: LatLng, radiusMeters: number): string {
   return `${Math.round(center.lat * 67)},${Math.round(center.lon * 67)}|${Math.round(radiusMeters / 2000)}`;
 }
 
-async function fetchScenicAndRoutingFeatures(
+function emptyAreaContext(): AreaContextData {
+  return {
+    pois: [],
+    parks: [],
+    tracks: [],
+    envSignals: {
+      litPoints: [],
+      unlitPoints: [],
+      trafficSignals: [],
+      waterFountains: [],
+      restrooms: [],
+    },
+  };
+}
+
+/**
+ * Fetches parks, running tracks, scenic POIs, street lighting, traffic signals,
+ * drinking water, and restrooms in ONE single Overpass query (with mirror fallback + 30m cache).
+ */
+async function fetchAreaContext(
   center: LatLng,
   radiusMeters: number
-): Promise<{
-  pois: ScenicPOI[];
-  parks: ParkGeometry[];
-  tracks: TrackGeometry[];
-}> {
+): Promise<AreaContextData> {
   const r = Math.min(Math.max(Math.round(radiusMeters), 1800), 6500);
+  const envR = Math.min(r, 4200);
   const cacheKey = overpassGridKey(center, r);
-  const cached = scenicFeatureCache.get(cacheKey);
+  const cached = areaContextCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.data;
   }
@@ -231,32 +278,58 @@ async function fetchScenicAndRoutingFeatures(
       node["historic"~"monument|memorial"](around:${r},${center.lat},${center.lon});
       way["waterway"~"river|canal"](around:${r},${center.lat},${center.lon});
       way["natural"="water"](around:${r},${center.lat},${center.lon});
+      node["highway"="street_lamp"](around:${envR},${center.lat},${center.lon});
+      way["lit"="yes"](around:${envR},${center.lat},${center.lon});
+      way["lit"="no"](around:${envR},${center.lat},${center.lon});
+      node["highway"="traffic_signals"](around:${envR},${center.lat},${center.lon});
+      node["amenity"="drinking_water"](around:${envR},${center.lat},${center.lon});
+      node["amenity"="toilets"](around:${envR},${center.lat},${center.lon});
     );
-    out center geom 45;
+    out center geom 140;
   `;
 
   try {
-    const res = await fetch(OVERPASS_BASE, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": USER_AGENT,
-      },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(2600),
-    });
+    const data = await fetchOverpassWithMirror(query, 2400);
+    if (!data) return emptyAreaContext();
 
-    if (!res.ok) return { pois: [], parks: [], tracks: [] };
-    const data = (await res.json()) as { elements?: OverpassElement[] };
     const pois: ScenicPOI[] = [];
     const parks: ParkGeometry[] = [];
     const tracks: TrackGeometry[] = [];
+    const litPoints: LatLng[] = [];
+    const unlitPoints: LatLng[] = [];
+    const trafficSignals: LatLng[] = [];
+    const waterFountains: LatLng[] = [];
+    const restrooms: LatLng[] = [];
     const seen = new Set<string>();
 
     for (const el of data.elements || []) {
       const lat = el.lat ?? el.center?.lat;
       const lon = el.lon ?? el.center?.lon;
       const tags = el.tags || {};
+
+      // Environment signals
+      if (lat && lon) {
+        if (tags.highway === "traffic_signals") {
+          trafficSignals.push({ lat, lon });
+          continue;
+        }
+        if (tags.amenity === "drinking_water") {
+          waterFountains.push({ lat, lon });
+          continue;
+        }
+        if (tags.amenity === "toilets") {
+          restrooms.push({ lat, lon });
+          continue;
+        }
+        if (tags.lit === "no") {
+          unlitPoints.push({ lat, lon });
+          continue;
+        }
+        if (tags.highway === "street_lamp" || tags.lit === "yes") {
+          litPoints.push({ lat, lon });
+          continue;
+        }
+      }
 
       if (tags.leisure === "track" && el.geometry && el.geometry.length >= 6) {
         const sport = (tags.sport || "").toLowerCase();
@@ -313,18 +386,29 @@ async function fetchScenicAndRoutingFeatures(
 
       pois.push({ name, category, lat, lon });
     }
-    const result = { pois, parks, tracks };
-    if (scenicFeatureCache.size >= OVERPASS_CACHE_MAX) {
-      const oldest = scenicFeatureCache.keys().next().value;
-      if (oldest) scenicFeatureCache.delete(oldest);
+    const result: AreaContextData = {
+      pois,
+      parks,
+      tracks,
+      envSignals: {
+        litPoints,
+        unlitPoints,
+        trafficSignals,
+        waterFountains,
+        restrooms,
+      },
+    };
+    if (areaContextCache.size >= OVERPASS_CACHE_MAX) {
+      const oldest = areaContextCache.keys().next().value;
+      if (oldest) areaContextCache.delete(oldest);
     }
-    scenicFeatureCache.set(cacheKey, {
+    areaContextCache.set(cacheKey, {
       expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
       data: result,
     });
     return result;
   } catch {
-    return { pois: [], parks: [], tracks: [] };
+    return emptyAreaContext();
   }
 }
 
@@ -598,6 +682,68 @@ async function resolveFoodViaGooglePlaces(
   return results;
 }
 
+const PHOTON_NON_FOOD_KEYS = new Set([
+  "highway",
+  "building",
+  "office",
+  "landuse",
+  "natural",
+  "railway",
+  "public_transport",
+  "healthcare",
+  "aeroway",
+  "boundary",
+  "place",
+]);
+
+const PHOTON_NON_FOOD_VALUES = new Set([
+  "hotel",
+  "motel",
+  "hostel",
+  "school",
+  "college",
+  "university",
+  "hospital",
+  "clinic",
+  "doctors",
+  "dentist",
+  "bank",
+  "atm",
+  "pharmacy",
+  "parking",
+  "fuel",
+  "apartments",
+  "residential",
+  "house",
+  "yes",
+  "commercial",
+  "industrial",
+]);
+
+const PHOTON_FOOD_VALUES = new Set([
+  "restaurant",
+  "fast_food",
+  "cafe",
+  "bar",
+  "pub",
+  "biergarten",
+  "ice_cream",
+  "food_court",
+  "bakery",
+  "coffee",
+  "pastry",
+  "deli",
+  "confectionery",
+  "tea",
+  "chocolate",
+  "beverages",
+  "butcher",
+  "seafood",
+  "cheese",
+  "supermarket",
+  "convenience",
+]);
+
 async function resolveFoodViaPhoton(
   start: LatLng,
   endQuery: string,
@@ -610,7 +756,7 @@ async function resolveFoodViaPhoton(
     const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(endQuery)}&lat=${start.lat}&lon=${start.lon}&limit=25`;
     const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
-      signal: AbortSignal.timeout(4500),
+      signal: AbortSignal.timeout(2600),
     });
     if (!res.ok) return [];
     const data = (await res.json()) as {
@@ -627,25 +773,37 @@ async function resolveFoodViaPhoton(
       }[];
     };
 
+    const expandedTerms = expandFoodTerms(endQuery);
+
     const candidates = (data.features || [])
       .map((f) => {
         const coords = f.geometry?.coordinates;
         const props = f.properties;
         if (!coords || coords.length < 2 || !props?.name) return null;
+        // Filter out non-food noise (hotels, schools, offices, streets, flooring shops, etc.)
+        const osmKey = (props.osm_key || "").toLowerCase();
+        const osmVal = (props.osm_value || "").toLowerCase();
+        if (PHOTON_NON_FOOD_KEYS.has(osmKey) || PHOTON_NON_FOOD_VALUES.has(osmVal)) {
+          return null;
+        }
+        const isFoodOsm =
+          PHOTON_FOOD_VALUES.has(osmVal) ||
+          osmKey === "cuisine" ||
+          osmKey === "amenity";
+        const nameLower = props.name.toLowerCase();
+        const nameMatchesFood = expandedTerms.some((t) => nameLower.includes(t));
+        if (!isFoodOsm && !nameMatchesFood) return null;
+
         const [lon, lat] = coords;
         const dist = haversineMeters(start, { lat, lon });
         if (dist > maxAllowedDist || dist < 120) return null;
-        const isFoodOsm =
-          props.osm_key === "amenity" ||
-          props.osm_key === "shop" ||
-          props.osm_key === "cuisine";
         // Prefer spots close to idealMeters and inside [minStraightMeters, maxAllowedDist]
         const rangeMissPenalty =
           dist < minStraightMeters ? (minStraightMeters - dist) * 1.4 : 0;
         const score =
           Math.abs(dist - idealMeters) +
           rangeMissPenalty -
-          (isFoodOsm ? 400 : 0);
+          (PHOTON_FOOD_VALUES.has(osmVal) ? 500 : 0);
         return {
           name: props.name,
           area: props.district || props.city || props.street || "",
@@ -738,7 +896,7 @@ async function resolveEndPlaces(
     if (regexPattern) {
       const overRadius = Math.min(Math.round(maxAllowedDist), 9000);
       const overQuery = `
-        [out:json][timeout:6];
+        [out:json][timeout:3];
         (
           node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["name"~"${regexPattern}",i](around:${overRadius},${start.lat},${start.lon});
           node["amenity"~"cafe|restaurant|fast_food|bar|pub|biergarten|ice_cream"]["cuisine"~"${regexPattern}",i](around:${overRadius},${start.lat},${start.lon});
@@ -747,17 +905,8 @@ async function resolveEndPlaces(
         out 40;
       `;
       try {
-        const res = await fetch(OVERPASS_BASE, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": USER_AGENT,
-          },
-          body: `data=${encodeURIComponent(overQuery)}`,
-          signal: AbortSignal.timeout(7000),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { elements?: OverpassElement[] };
+        const data = await fetchOverpassWithMirror(overQuery, 2500);
+        if (data) {
           const candidates = (data.elements || [])
             .map((el) => {
               const lat = el.lat ?? el.center?.lat;
@@ -1116,100 +1265,6 @@ interface RouteEnvironmentSignals {
   trafficSignals: LatLng[];
   waterFountains: LatLng[];
   restrooms: LatLng[];
-}
-
-async function fetchRouteEnvironmentSignals(
-  center: LatLng,
-  radiusMeters: number
-): Promise<RouteEnvironmentSignals> {
-  const r = Math.min(Math.max(Math.round(radiusMeters), 1500), 4500);
-  const cacheKey = overpassGridKey(center, r);
-  const cached = envSignalsCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data;
-  }
-
-  const query = `
-    [out:json][timeout:3];
-    (
-      node["highway"="street_lamp"](around:${r},${center.lat},${center.lon});
-      way["lit"="yes"](around:${r},${center.lat},${center.lon});
-      way["lit"="no"](around:${r},${center.lat},${center.lon});
-      node["highway"="traffic_signals"](around:${r},${center.lat},${center.lon});
-      node["amenity"="drinking_water"](around:${r},${center.lat},${center.lon});
-      node["amenity"="toilets"](around:${r},${center.lat},${center.lon});
-    );
-    out center 180;
-  `;
-
-  try {
-    const res = await fetch(OVERPASS_BASE, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": USER_AGENT,
-      },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(2400),
-    });
-    if (!res.ok) {
-      return {
-        litPoints: [],
-        unlitPoints: [],
-        trafficSignals: [],
-        waterFountains: [],
-        restrooms: [],
-      };
-    }
-    const data = (await res.json()) as { elements?: OverpassElement[] };
-    const litPoints: LatLng[] = [];
-    const unlitPoints: LatLng[] = [];
-    const trafficSignals: LatLng[] = [];
-    const waterFountains: LatLng[] = [];
-    const restrooms: LatLng[] = [];
-
-    for (const el of data.elements || []) {
-      const lat = el.lat ?? el.center?.lat;
-      const lon = el.lon ?? el.center?.lon;
-      if (!lat || !lon) continue;
-      const tags = el.tags || {};
-      if (tags.highway === "traffic_signals") {
-        trafficSignals.push({ lat, lon });
-      } else if (tags.amenity === "drinking_water") {
-        waterFountains.push({ lat, lon });
-      } else if (tags.amenity === "toilets") {
-        restrooms.push({ lat, lon });
-      } else if (tags.lit === "no") {
-        unlitPoints.push({ lat, lon });
-      } else {
-        litPoints.push({ lat, lon });
-      }
-    }
-    const result: RouteEnvironmentSignals = {
-      litPoints,
-      unlitPoints,
-      trafficSignals,
-      waterFountains,
-      restrooms,
-    };
-    if (envSignalsCache.size >= OVERPASS_CACHE_MAX) {
-      const oldest = envSignalsCache.keys().next().value;
-      if (oldest) envSignalsCache.delete(oldest);
-    }
-    envSignalsCache.set(cacheKey, {
-      expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
-      data: result,
-    });
-    return result;
-  } catch {
-    return {
-      litPoints: [],
-      unlitPoints: [],
-      trafficSignals: [],
-      waterFountains: [],
-      restrooms: [],
-    };
-  }
 }
 
 function computeNightLightingScore(
@@ -1582,12 +1637,13 @@ export async function POST(req: NextRequest) {
           )
         : Promise.resolve([]);
 
-    const [resolvedEnds, { pois: scenicPois, parks, tracks }, envSignals] =
-      await Promise.all([
-        resolveEndsPromise,
-        fetchScenicAndRoutingFeatures(start, searchRadius),
-        fetchRouteEnvironmentSignals(start, searchRadius),
-      ]);
+    const [
+      resolvedEnds,
+      { pois: scenicPois, parks, tracks, envSignals },
+    ] = await Promise.all([
+      resolveEndsPromise,
+      fetchAreaContext(start, searchRadius),
+    ]);
     const resolvedEnd: PlaceSuggestion | null = resolvedEnds[0] || null;
 
     const routes: RunRoute[] = [];
@@ -2041,19 +2097,22 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Fetch real elevation stats in parallel BEFORE final ranking so elevation preference works accurately
-    await Promise.all(
-      routes.map(async (r) => {
-        const elev = await fetchRouteElevationStats(
-          r.coordinates,
-          r.distanceMiles
-        );
-        if (elev) {
-          r.elevationGainFt = elev.elevationGainFt;
-          r.terrainLabel = elev.terrainLabel;
-        }
-      })
-    );
+    // Only fetch elevation BEFORE ranking when user requested Flat/Hilly terrain;
+    // for "any", deduplicate first so we skip wasted elevation calls on pruned routes.
+    if (elevationPref !== "any") {
+      await Promise.all(
+        routes.map(async (r) => {
+          const elev = await fetchRouteElevationStats(
+            r.coordinates,
+            r.distanceMiles
+          );
+          if (elev) {
+            r.elevationGainFt = elev.elevationGainFt;
+            r.terrainLabel = elev.terrainLabel;
+          }
+        })
+      );
+    }
 
     // Cost-weighted multi-objective ranking:
     // prioritizes car-free & low-traffic paths, scenery, minimal traffic lights,
@@ -2157,6 +2216,22 @@ export async function POST(req: NextRequest) {
       });
       if (!isDup) uniqueRoutes.push(r);
       if (uniqueRoutes.length >= 9) break;
+    }
+
+    // For "any" terrain, fetch elevation only on the final deduplicated routes (skips wasted calls on pruned candidates)
+    if (elevationPref === "any" && uniqueRoutes.length > 0) {
+      await Promise.all(
+        uniqueRoutes.map(async (r) => {
+          const elev = await fetchRouteElevationStats(
+            r.coordinates,
+            r.distanceMiles
+          );
+          if (elev) {
+            r.elevationGainFt = elev.elevationGainFt;
+            r.terrainLabel = elev.terrainLabel;
+          }
+        })
+      );
     }
 
     return NextResponse.json({
