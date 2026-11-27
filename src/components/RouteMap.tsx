@@ -53,6 +53,7 @@ export default function RouteMap({
         center: initialCenterRef.current,
         zoom: 13,
         zoomControl: false,
+        attributionControl: false,
       });
 
       const tileUrl =
@@ -61,8 +62,6 @@ export default function RouteMap({
 
       leaflet
         .tileLayer(tileUrl, {
-          attribution:
-            "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, GeoBase, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), and the GIS User Community",
           maxZoom: 19,
         })
         .addTo(map);
@@ -231,13 +230,15 @@ export default function RouteMap({
     }
   }, [mapReady, routes, activeRouteId, startLocation, center, onSelectRoute]);
 
+  const canPickStart = Boolean(onPickStart && routes.length === 0);
+
   return (
-    <div className="relative w-full h-full">
-      <div
-        ref={containerRef}
-        className={`w-full h-full z-0 ${onPickStart && routes.length === 0 ? "cursor-crosshair" : ""}`}
-      />
-      {onPickStart && routes.length === 0 && (
+    <div
+      className={`relative w-full h-full ${canPickStart ? "map-pick-mode" : ""}`}
+    >
+      {/* Keep className static on the Leaflet mount node so React never wipes Leaflet's own classes (leaflet-container, etc.) */}
+      <div ref={containerRef} className="w-full h-full z-0" />
+      {canPickStart && (
         <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-[400] px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-xs shadow-md border border-slate-200/80 text-[11px] font-semibold text-slate-700 whitespace-nowrap">
           {startLocation
             ? "Tap anywhere on the map to move Start"
